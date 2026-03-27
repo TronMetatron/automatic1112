@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.Python
+env/
+venv/
+hunyuan_env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HuggingFace cache (regenerated at runtime)
+.hf_cache/
+.torch_cache/
+
+# Model weights (too large for git — download separately)
+HunyuanImage-3.0/
+
+# Generated outputs
+outputs/
+
+# Backup files from patches
+*.orig
+
+# Environment files
+.env
+.env*
+
+# Wildcard data (large JSON)
+wildcards.json

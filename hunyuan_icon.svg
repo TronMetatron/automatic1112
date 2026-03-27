@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Background gradient -->
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#667eea"/>
+      <stop offset="100%" style="stop-color:#764ba2"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffffff;stop-opacity:0.3"/>
+      <stop offset="50%" style="stop-color:#ffffff;stop-opacity:0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#shine)"/>
+
+  <!-- Stylized "H" for Hunyuan -->
+  <path d="M 36 32 L 36 96 L 48 96 L 48 68 L 80 68 L 80 96 L 92 96 L 92 32 L 80 32 L 80 56 L 48 56 L 48 32 Z"
+        fill="white" opacity="0.95"/>
+
+  <!-- Sparkle/AI effect -->
+  <circle cx="100" cy="28" r="6" fill="#ffd700"/>
+  <circle cx="100" cy="28" r="3" fill="white"/>
+
+  <!-- Small dots for "AI magic" effect -->
+  <circle cx="24" cy="100" r="3" fill="white" opacity="0.6"/>
+  <circle cx="32" cy="92" r="2" fill="white" opacity="0.4"/>
+  <circle cx="96" cy="100" r="2" fill="white" opacity="0.5"/>
+</svg>
