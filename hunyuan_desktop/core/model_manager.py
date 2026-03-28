@@ -224,30 +224,30 @@ def load_model(model_type: str = None) -> Generator[str, None, None]:
             if not hasattr(state.model.generation_config, 'flow_shift'):
                 state.model.generation_config.flow_shift = 3.0
             
-            # Move vision model to same GPU (prevents memory fragmentation)
-            if hasattr(state.model, 'vision_model') and state.model.vision_model is not None:
+            # Move vision model to same GPU only in single-GPU mode.
+            # In dual-GPU mode, accelerate hooks manage device placement — calling .to()
+            # moves weights but hooks still route inputs to the device_map device, causing
+            # a cuda:0 vs cuda:1 mismatch in the vision encoder.
+            if num_gpus < 2 and hasattr(state.model, 'vision_model') and state.model.vision_model is not None:
                 print(f"[LOAD] Moving vision model to {device}...")
                 state.model.vision_model = state.model.vision_model.to(device)
                 if hasattr(state.model.vision_model, 'encoder'):
                     state.model.vision_model.encoder = state.model.vision_model.encoder.to(device)
 
-        # Model is loaded - set flag and type
-        state.model_loaded = True
         state.model_type = model_type
 
-        # Try to load tokenizer
+        # Try to load tokenizer (must complete before marking model as loaded)
         print("[LOAD] Loading tokenizer...")
         yield "Step 5: Loading tokenizer..."
         try:
-            state.model.load_tokenizer(model_id, local_files_only=True)
+            state.model.load_tokenizer(model_id)
             print("[LOAD] Tokenizer loaded successfully!")
         except Exception as tok_err:
-            print(f"[LOAD] Tokenizer load warning (model still works): {tok_err}")
-            try:
-                state.model.load_tokenizer(model_id)
-                print("[LOAD] Tokenizer loaded (fallback method)")
-            except Exception:
-                print("[LOAD] Tokenizer fallback also failed - model may still work for generation")
+            print(f"[LOAD] Tokenizer load failed: {tok_err}")
+            print("[LOAD] WARNING: Model loaded without tokenizer - think/recaption tasks may fail")
+
+        # Mark model as loaded only after tokenizer is ready
+        state.model_loaded = True
 
         # Show GPU memory usage
         if torch.cuda.is_available():
@@ -551,21 +551,20 @@ def _load_int8_model(model_type: str) -> "Generator[str, None, None]":
             if not hasattr(state.model.generation_config, 'flow_shift'):
                 state.model.generation_config.flow_shift = 3.0
 
-        state.model_loaded = True
         state.model_type = model_type
 
-        # Load tokenizer
+        # Load tokenizer (must complete before marking model as loaded)
         yield "Step 5: Loading tokenizer..."
         print("[INT8 LOAD] Loading tokenizer...")
         try:
-            state.model.load_tokenizer(model_id, local_files_only=True)
-            print("[INT8 LOAD] Tokenizer loaded (local)")
-        except Exception:
-            try:
-                state.model.load_tokenizer(model_id)
-                print("[INT8 LOAD] Tokenizer loaded (fallback)")
-            except Exception as tok_err:
-                print(f"[INT8 LOAD] Tokenizer warning: {tok_err}")
+            state.model.load_tokenizer(model_id)
+            print("[INT8 LOAD] Tokenizer loaded successfully!")
+        except Exception as tok_err:
+            print(f"[INT8 LOAD] Tokenizer load failed: {tok_err}")
+            print("[INT8 LOAD] WARNING: Model loaded without tokenizer - think/recaption tasks may fail")
+
+        # Mark model as loaded only after tokenizer is ready
+        state.model_loaded = True
 
         if torch.cuda.is_available():
             mem_used = torch.cuda.memory_allocated(device_index) / (1024**3)
