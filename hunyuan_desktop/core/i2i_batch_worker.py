@@ -78,16 +78,58 @@ class I2IBatchWorker(QThread):
                 self.error.emit("Model not loaded. Load an Instruct or Distil model first.")
                 return
 
-        if state.model_type not in ("instruct", "distil", "deepgen", "firered", "instruct_int8", "distil_int8"):
+        if state.model_type not in ("instruct", "distil", "nf4", "distil_nf4", "deepgen", "firered", "instruct_int8", "distil_int8"):
             self.error.emit(
                 f"I2I batch requires Instruct, Distil, DeepGen, or FireRed model (not Base). "
                 f"Current model: {state.model_type}"
             )
             return
 
-        if not config.global_images and not config.prompt_image_overrides:
+        # Pre-scan folder slots so we can cycle through them per generation.
+        # folder_images[slot_idx] is a sorted list of paths (or [] if no folder).
+        IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+        folder_images = [[], [], []]
+        slot_folders = list(config.global_image_folders or []) + ["", "", ""]
+        slot_singles = list(config.global_image_slots or []) + ["", "", ""]
+        for i in range(3):
+            folder = slot_folders[i]
+            if folder:
+                p = Path(folder)
+                if p.is_dir():
+                    folder_images[i] = sorted(
+                        str(f) for f in p.iterdir()
+                        if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+                    )
+                if folder_images[i]:
+                    print(f"[I2I BATCH] Slot {i+1} folder: {folder} "
+                          f"({len(folder_images[i])} images, will cycle)")
+
+        has_any_slot_image = any(folder_images) or any(slot_singles[:3])
+        if (not config.global_images
+                and not config.prompt_image_overrides
+                and not has_any_slot_image):
             self.error.emit("No reference images provided. Add at least one image.")
             return
+
+        def _images_for_generation(prompt_idx: int, gen_index: int) -> list:
+            """Build the per-generation reference image list.
+
+            Per-prompt [img:] overrides take precedence. Otherwise build from
+            slot folders (cycling) and slot singles. Falls back to legacy
+            global_images if no slot data is present.
+            """
+            if prompt_idx in config.prompt_image_overrides:
+                return list(config.prompt_image_overrides[prompt_idx])
+            built = []
+            for slot_i in range(3):
+                if folder_images[slot_i]:
+                    imgs = folder_images[slot_i]
+                    built.append(imgs[gen_index % len(imgs)])
+                elif slot_singles[slot_i]:
+                    built.append(slot_singles[slot_i])
+            if built:
+                return built
+            return list(config.global_images)
 
         # Create batch output directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -102,18 +144,38 @@ class I2IBatchWorker(QThread):
             self.error.emit("Model not available")
             return
 
-        # Initialize Ollama if needed
+        # Initialize Ollama / LM Studio enhancer (with lazy init)
         ollama_model_name = None
-        if config.enhance and state.ollama_available:
+        print(f"\n{'='*60}")
+        print(f"[I2I BATCH OLLAMA] Enhancement Status Check:")
+        print(f"[I2I BATCH OLLAMA]   config.enhance: {config.enhance}")
+        print(f"[I2I BATCH OLLAMA]   ollama_available: {state.ollama_available}")
+        print(f"[I2I BATCH OLLAMA]   ollama_enhancer exists: {state.ollama_enhancer is not None}")
+
+        # Lazy init: if enhance requested but enhancer not ready, set it up now
+        if config.enhance and (not state.ollama_available or state.ollama_enhancer is None):
+            print(f"[I2I BATCH OLLAMA]   Lazy-initializing enhancer...")
+            self.progress.emit(0, config.total_images(), "Initializing prompt enhancer...")
+            try:
+                from ollama_prompts import PromptEnhancer
+                state.ollama_enhancer = PromptEnhancer()
+                state.ollama_available = True
+                print(f"[I2I BATCH OLLAMA] ✓ Enhancer initialized")
+            except Exception as e:
+                print(f"[I2I BATCH OLLAMA] ✗ Failed to init enhancer: {e}")
+
+        if config.enhance and state.ollama_available and state.ollama_enhancer:
             ollama_model_name = config.ollama_model
             if any(size in ollama_model_name.lower() for size in ("30b", "24b", "20b")):
                 ollama_model_name = "qwen2.5:7b-instruct"
-            if state.ollama_enhancer is None:
-                from ollama_prompts import PromptEnhancer
-                state.ollama_enhancer = PromptEnhancer()
+            print(f"[I2I BATCH OLLAMA] ✓ ENHANCEMENT ENABLED — model: {ollama_model_name}")
+        elif config.enhance:
+            print(f"[I2I BATCH OLLAMA] ✗ ENHANCEMENT REQUESTED BUT UNAVAILABLE")
+        print(f"{'='*60}\n")
 
         total_images = config.total_images()
         total_count = 0
+        gen_index = 0  # increments per generation, used to cycle through folders
         generated_images = []
 
         prompts = config.prompts
@@ -128,16 +190,6 @@ class I2IBatchWorker(QThread):
                 if self._stop_requested:
                     break
 
-                # Get images for this prompt
-                img_paths = config.get_images_for_prompt(prompt_idx)
-                if not img_paths:
-                    # Skip prompts with no images
-                    self.progress.emit(
-                        total_count, total_images,
-                        f"Skipping prompt {prompt_idx+1} (no images)"
-                    )
-                    continue
-
                 for style in styles:
                     if self._stop_requested:
                         break
@@ -145,6 +197,16 @@ class I2IBatchWorker(QThread):
                     for img_idx in range(config.images_per_combo):
                         if self._stop_requested:
                             break
+
+                        # Resolve per-generation reference images (cycles folders)
+                        img_paths = _images_for_generation(prompt_idx, gen_index)
+                        if not img_paths:
+                            self.progress.emit(
+                                total_count, total_images,
+                                f"Skipping prompt {prompt_idx+1} (no images)"
+                            )
+                            gen_index += 1
+                            continue
 
                         # Build prompt with style suffix
                         full_prompt = prompt_text
@@ -248,7 +310,7 @@ class I2IBatchWorker(QThread):
                                         seed=current_seed,
                                         image_size="auto",
                                         bot_task=config.bot_task,
-                                        steps=8,
+                                        steps=config.get_steps(state.model_type),
                                         guidance_scale=config.guidance_scale,
                                         i2i_images=img_paths,
                                         progress_callback=_progress_cb,
@@ -278,7 +340,7 @@ class I2IBatchWorker(QThread):
                                         seed=current_seed,
                                         width=None,
                                         height=None,
-                                        steps=config.steps if hasattr(config, 'steps') and config.steps else 40,
+                                        steps=config.get_steps(state.model_type),
                                         true_cfg_scale=firered_cfg,
                                         src_image_path=img_paths,
                                     )
@@ -295,20 +357,27 @@ class I2IBatchWorker(QThread):
                                         seed=current_seed,
                                         width=512,
                                         height=512,
-                                        steps=50,
+                                        steps=config.get_steps(state.model_type),
                                         guidance_scale=deepgen_guidance,
                                         src_image_path=src_path,
                                     )
                                 else:
+                                    # Use think_recaption for I2I when bot_task is "image"
+                                    # to let the model analyze the input image properly
+                                    i2i_task = config.bot_task
+                                    if i2i_task == "image":
+                                        i2i_task = "think_recaption"
+                                    # Use quality preset from config
+                                    i2i_steps = config.get_steps(state.model_type)
                                     result = model.generate_image(
                                         prompt=full_prompt,
                                         seed=current_seed,
                                         image=img_arg,
                                         image_size="auto",
                                         use_system_prompt="en_vanilla",
-                                        bot_task=config.bot_task,
+                                        bot_task=i2i_task,
                                         infer_align_image_size=True,
-                                        diff_infer_steps=8,  # Distil default
+                                        diff_infer_steps=i2i_steps,
                                         diff_guidance_scale=config.guidance_scale,
                                     )
                                 print(f"[I2I BATCH] ✓ generation returned successfully")
@@ -402,6 +471,8 @@ class I2IBatchWorker(QThread):
                             self.progress.emit(
                                 total_count, total_images, f"Error: {e}"
                             )
+
+                        gen_index += 1
 
         # Write batch manifest
         manifest = {

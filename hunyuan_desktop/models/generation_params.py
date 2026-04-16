@@ -29,7 +29,7 @@ class GenerationParams:
 
     # Image-to-Image (instruct/distil only)
     input_image_path: Optional[str] = None  # Legacy single image (backward compat)
-    input_image_paths: List[str] = field(default_factory=list)  # Multi-image (up to 2)
+    input_image_paths: List[str] = field(default_factory=list)  # Multi-image (up to 3)
     i2i_strength: float = 0.8
     guidance_scale: float = 5.0
 

@@ -39,7 +39,8 @@ def main():
     gpu_status()
 
     # Model path
-    model_id = "/home/james/hun3d/HunyuanImage3-Instruct-SDNQ"
+    from ui.constants import MODEL_DIR
+    model_id = str(MODEL_DIR / "HunyuanImage3-Instruct-SDNQ")
     print(f"\nModel: {model_id}")
 
     # Import SDNQ
@@ -172,19 +173,19 @@ def main():
                 # Try to find the image in the result
                 for i, item in enumerate(result):
                     if hasattr(item, 'save'):
-                        outpath = "/home/james/hunyuan_desktop/outputs/test_headless.png"
+                        outpath = "outputs/test_headless.png"
                         os.makedirs(os.path.dirname(outpath), exist_ok=True)
                         item.save(outpath)
                         print(f"  Image saved to {outpath}")
                         break
                     elif isinstance(item, list) and len(item) > 0 and hasattr(item[0], 'save'):
-                        outpath = "/home/james/hunyuan_desktop/outputs/test_headless.png"
+                        outpath = "outputs/test_headless.png"
                         os.makedirs(os.path.dirname(outpath), exist_ok=True)
                         item[0].save(outpath)
                         print(f"  Image saved to {outpath}")
                         break
             elif hasattr(result, 'save'):
-                outpath = "/home/james/hunyuan_desktop/outputs/test_headless.png"
+                outpath = "outputs/test_headless.png"
                 os.makedirs(os.path.dirname(outpath), exist_ok=True)
                 result.save(outpath)
                 print(f"  Image saved to {outpath}")

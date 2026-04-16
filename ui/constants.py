@@ -1,17 +1,16 @@
 """
-Constants and configuration presets for HunyuanImage-3.0 Desktop UI.
-Configured for remote model loading — local GPUs stay free.
+Constants and configuration presets for Automatic1112 Desktop UI.
 """
 
+import os
 from pathlib import Path
 
 # =============================================================================
 # Paths
 # =============================================================================
 
-# Base paths — models live in the hun3d directory
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-MODEL_DIR = Path("/home/james/hun3d")
+MODEL_DIR = Path(os.environ.get("A1112_MODEL_DIR", str(Path.home() / "automatic1112_models")))
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 
 # Model variants (pointing to hun3d model copies)
@@ -19,6 +18,9 @@ MODEL_PATHS = {
     "base": MODEL_DIR / "HunyuanImage3-SDNQ",
     "instruct": MODEL_DIR / "HunyuanImage3-Instruct-SDNQ",
     "distil": MODEL_DIR / "HunyuanImage3-Distil-SDNQ",
+    "nf4": MODEL_DIR / "HunyuanImage3-Instruct-NF4-v2",
+    "distil_nf4": MODEL_DIR / "HunyuanImage3-Distil-NF4-v2",
+    "firered": MODEL_DIR / "FireRed-Image-Edit-1.1",
 }
 
 MODEL_INFO = {
@@ -38,6 +40,24 @@ MODEL_INFO = {
         "name": "HunyuanImage-3.0 Instruct-Distil",
         "description": "Fast T2I + I2I with think mode (8 steps)",
         "default_steps": 8,
+        "supports_img2img": True,
+    },
+    "nf4": {
+        "name": "HunyuanImage-3.0 Instruct NF4",
+        "description": "NF4 4-bit quantized Instruct (single GPU, ~48GB VRAM)",
+        "default_steps": 50,
+        "supports_img2img": True,
+    },
+    "distil_nf4": {
+        "name": "HunyuanImage-3.0 Distil NF4",
+        "description": "NF4 4-bit quantized Distil — fast 8-step T2I+I2I (single GPU, ~48GB VRAM)",
+        "default_steps": 8,
+        "supports_img2img": True,
+    },
+    "firered": {
+        "name": "FireRed Image Edit 1.1",
+        "description": "Image editing model (Qwen-Image backbone, T2I + I2I, up to 3 ref images)",
+        "default_steps": 40,
         "supports_img2img": True,
     },
 }
@@ -111,6 +131,10 @@ DEEPGEN_QUALITY_PRESETS = {
     "Maximum": {"steps": 100, "description": "Best quality, slowest"},
 }
 
+DISTIL_QUALITY_PRESETS = {
+    "Distil (8 steps)": {"steps": 8, "description": "Distilled model default (recommended)"},
+}
+
 FIRERED_QUALITY_PRESETS = {
     "Draft (20 steps)": {"steps": 20, "description": "Quick preview edit"},
     "Standard (30 steps)": {"steps": 30, "description": "Good balance"},
@@ -121,6 +145,8 @@ FIRERED_QUALITY_PRESETS = {
 MODEL_DEFAULT_QUALITY = {
     "base": "Standard",
     "instruct": "Maximum",
+    "nf4": "Maximum",
+    "distil_nf4": "Distil (8 steps)",
     "distil": "Distil (8 steps)",
     "deepgen": "Standard",
     "firered": "High Quality",
@@ -154,8 +180,20 @@ DEFAULT_STYLE_PRESETS = {
 # LM Studio / Prompt Enhancement Settings
 # =============================================================================
 
-# LM Studio on remote machine (james-rtx.local)
-LMSTUDIO_URL = "http://192.168.50.30:1234"
+# LM Studio — default URL, overridable via settings or env var
+LMSTUDIO_URL = os.environ.get("A1112_LMSTUDIO_URL", "http://localhost:1234")
+
+
+def get_lmstudio_url() -> str:
+    """Get the LM Studio URL from settings, falling back to LMSTUDIO_URL default."""
+    try:
+        from core.settings import get_settings
+        url = get_settings().lmstudio_url
+        if url:
+            return url
+    except Exception:
+        pass
+    return LMSTUDIO_URL
 
 # Fallback model list
 OLLAMA_MODELS = ["lmstudio"]
@@ -197,6 +235,8 @@ DEEPGEN_DEFAULT_GUIDANCE = 4.0
 
 def get_quality_presets(model_type=None):
     """Get quality presets for the given model type."""
+    if model_type in ("distil", "distil_int8", "distil_nf4"):
+        return DISTIL_QUALITY_PRESETS
     if model_type == "deepgen":
         return DEEPGEN_QUALITY_PRESETS
     if model_type == "firered":
@@ -217,6 +257,8 @@ def get_default_guidance(model_type=None):
         return DEEPGEN_DEFAULT_GUIDANCE
     if model_type == "firered":
         return 4.0
+    if model_type in ("nf4", "distil_nf4"):
+        return 2.5  # NF4-v2 model's recommended guidance scale
     return DEFAULT_GUIDANCE_SCALE
 
 
@@ -232,4 +274,4 @@ def is_int8_model(model_type):
 
 def is_instruct_like(model_type):
     """Check if a model type supports instruct features (I2I, think mode, bot_task)."""
-    return model_type in ("instruct", "distil", "instruct_int8", "distil_int8")
+    return model_type in ("instruct", "distil", "nf4", "distil_nf4", "instruct_int8", "distil_int8")

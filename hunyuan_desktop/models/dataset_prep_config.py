@@ -91,12 +91,30 @@ class DatasetPrepConfig:
 
     # Generation settings
     images_per_pass: int = 1
+    quality: str = "Standard"  # Quality preset name (maps to steps via constants)
     guidance_scale: float = 5.0
     random_seeds: bool = True
 
     # Bot task / think mode (read from global state at runtime)
     bot_task: str = "image"
     drop_think: bool = False
+
+    # Prompt enhancement (LM Studio / Ollama)
+    enhance: bool = False
+    ollama_model: str = "qwen2.5:7b-instruct"
+    ollama_length: str = "medium"
+    ollama_complexity: str = "detailed"
+    max_prompt_length: int = 0
+
+    def get_steps(self, model_type: str = None) -> int:
+        """Get inference steps from the quality preset for the given model type."""
+        from ui.constants import get_quality_presets
+        presets = get_quality_presets(model_type)
+        for name, info in presets.items():
+            if self.quality in name or name in self.quality:
+                return info["steps"]
+        from ui.constants import MODEL_INFO
+        return MODEL_INFO.get(model_type, {}).get("default_steps", 50)
 
     def total_images(self) -> int:
         """Calculate total images: source_count * enabled_passes * images_per_pass."""
@@ -133,10 +151,15 @@ class DatasetPrepConfig:
             "output_folder": self.output_folder,
             "enabled_passes": self.enabled_passes,
             "images_per_pass": self.images_per_pass,
+            "quality": self.quality,
             "guidance_scale": self.guidance_scale,
             "random_seeds": self.random_seeds,
             "bot_task": self.bot_task,
             "drop_think": self.drop_think,
+            "enhance": self.enhance,
+            "ollama_model": self.ollama_model,
+            "ollama_length": self.ollama_length,
+            "ollama_complexity": self.ollama_complexity,
         }
 
     @classmethod
@@ -147,8 +170,13 @@ class DatasetPrepConfig:
             output_folder=data.get("output_folder", ""),
             enabled_passes=data.get("enabled_passes", {}),
             images_per_pass=data.get("images_per_pass", 1),
+            quality=data.get("quality", "Standard"),
             guidance_scale=data.get("guidance_scale", 5.0),
             random_seeds=data.get("random_seeds", True),
             bot_task=data.get("bot_task", "image"),
             drop_think=data.get("drop_think", False),
+            enhance=data.get("enhance", False),
+            ollama_model=data.get("ollama_model", "qwen2.5:7b-instruct"),
+            ollama_length=data.get("ollama_length", "medium"),
+            ollama_complexity=data.get("ollama_complexity", "detailed"),
         )

@@ -97,7 +97,7 @@ class DatasetPrepWorker(QThread):
                 self.error.emit("Model not loaded. Load an Instruct or Distil model first.")
                 return
 
-        if state.model_type not in ("instruct", "distil", "instruct_int8", "distil_int8"):
+        if state.model_type not in ("instruct", "distil", "nf4", "distil_nf4", "instruct_int8", "distil_int8"):
             self.error.emit(
                 f"Dataset prep requires Instruct or Distil model. "
                 f"Current model: {state.model_type}"
@@ -124,6 +124,28 @@ class DatasetPrepWorker(QThread):
         if model is None:
             self.error.emit("Model not available")
             return
+
+        # Initialize Ollama / LM Studio enhancer (with lazy init)
+        ollama_model_name = None
+        print(f"\n{'='*60}")
+        print(f"[DATASET PREP OLLAMA] Enhancement check: enhance={config.enhance}, "
+              f"available={state.ollama_available}, "
+              f"enhancer={state.ollama_enhancer is not None}")
+        if config.enhance and (not state.ollama_available or state.ollama_enhancer is None):
+            print(f"[DATASET PREP OLLAMA]   Lazy-initializing enhancer...")
+            try:
+                from ollama_prompts import PromptEnhancer
+                state.ollama_enhancer = PromptEnhancer()
+                state.ollama_available = True
+                print(f"[DATASET PREP OLLAMA] ✓ Enhancer initialized")
+            except Exception as e:
+                print(f"[DATASET PREP OLLAMA] ✗ Failed to init enhancer: {e}")
+        if config.enhance and state.ollama_available and state.ollama_enhancer:
+            ollama_model_name = config.ollama_model
+            if any(s in ollama_model_name.lower() for s in ("30b", "24b", "20b")):
+                ollama_model_name = "qwen2.5:7b-instruct"
+            print(f"[DATASET PREP OLLAMA] ✓ ENHANCEMENT ENABLED — model: {ollama_model_name}")
+        print(f"{'='*60}\n")
 
         total_images = config.total_images_for_sources(len(source_images))
         total_count = 0
@@ -161,6 +183,44 @@ class DatasetPrepWorker(QThread):
                         except Exception:
                             pass
 
+                    # Prompt enhancement (LM Studio / Ollama)
+                    if (config.enhance and state.ollama_available
+                            and state.ollama_enhancer and ollama_model_name):
+                        try:
+                            actual_length = config.ollama_length
+                            actual_complexity = config.ollama_complexity
+                            if str(actual_length).lower() == "random":
+                                actual_length = random.choice([
+                                    "minimal", "short", "medium", "long",
+                                    "detailed", "cinematic", "experimental"
+                                ])
+                            if str(actual_complexity).lower() == "random":
+                                actual_complexity = random.choice([
+                                    "simple", "moderate", "detailed",
+                                    "complex", "cinematic", "experimental"
+                                ])
+                            enhanced = state.ollama_enhancer.enhance(
+                                full_prompt,
+                                length=str(actual_length),
+                                complexity=str(actual_complexity),
+                                model=ollama_model_name,
+                                max_length=config.max_prompt_length or 0,
+                            )
+                            clean = enhanced
+                            for prefix in [
+                                "Here is the enhanced prompt:",
+                                "Enhanced version:",
+                                "Here's the rewritten description:",
+                            ]:
+                                if clean.startswith(prefix):
+                                    clean = clean[len(prefix):].strip()
+                            if "ORIGINAL PROMPT:" in clean:
+                                clean = clean.split("ORIGINAL PROMPT:")[-1].strip()
+                            full_prompt = clean
+                            print(f"[DATASET PREP] Enhanced: {full_prompt[:80]}...")
+                        except Exception as e:
+                            print(f"[DATASET PREP] Enhancement failed: {e}")
+
                     # Generate seed
                     if config.random_seeds:
                         current_seed = random.randint(0, 2**31 - 1)
@@ -186,15 +246,20 @@ class DatasetPrepWorker(QThread):
                         print(f"[DATASET PREP] Source: {source_path}")
                         print(f"[DATASET PREP] Prompt: {full_prompt[:80]}...")
 
+                        # Use think_recaption for I2I when bot_task is "image"
+                        i2i_task = config.bot_task
+                        if i2i_task == "image":
+                            i2i_task = "think_recaption"
+
                         result = model.generate_image(
                             prompt=full_prompt,
                             seed=current_seed,
                             image=source_path,
                             image_size="auto",
                             use_system_prompt="en_vanilla",
-                            bot_task=config.bot_task,
+                            bot_task=i2i_task,
                             infer_align_image_size=True,
-                            diff_infer_steps=8,
+                            diff_infer_steps=config.get_steps(state.model_type),
                             diff_guidance_scale=config.guidance_scale,
                         )
 

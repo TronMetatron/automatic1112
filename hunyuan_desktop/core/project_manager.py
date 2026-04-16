@@ -1,9 +1,10 @@
 """Project save/load for complete UI state across all tabs.
 
-Saves and restores the entire application state (all 4 tabs) as a named project.
+Saves and restores the entire application state (all 5 tabs) as a named project.
 """
 
 import json
+import time
 from pathlib import Path
 
 
@@ -31,6 +32,11 @@ def save_project(name: str, project_dict: dict) -> str:
 
     if not safe_name:
         safe_name = "untitled_project"
+
+    # Embed save timestamp + display name into the file
+    project_dict = dict(project_dict)
+    project_dict["_saved_at"] = time.time()
+    project_dict["_display_name"] = name
 
     filepath = projects_dir / f"{safe_name}.json"
     with open(filepath, "w") as f:
@@ -67,16 +73,45 @@ def load_project(name: str) -> dict:
 
 
 def get_saved_projects() -> list:
-    """Get list of saved project names.
+    """Get list of saved project names (legacy: returns names only)."""
+    return [p["name"] for p in get_saved_projects_with_meta()]
+
+
+def get_saved_projects_with_meta() -> list:
+    """Get saved projects with metadata, sorted by save time (newest first).
 
     Returns:
-        List of project names (without .json extension)
+        List of dicts: {name, display_name, saved_at, path}
+        - name: stem (used as id for load/delete)
+        - display_name: human-readable name (from _display_name or stem)
+        - saved_at: epoch float (from embedded _saved_at, falling back to file mtime)
+        - path: full filepath as string
     """
     projects_dir = _get_projects_dir()
-    projects = []
-    for f in sorted(projects_dir.glob("*.json")):
-        projects.append(f.stem)
-    return projects
+    items = []
+    for f in projects_dir.glob("*.json"):
+        try:
+            saved_at = None
+            display_name = None
+            try:
+                with open(f) as fh:
+                    data = json.load(fh)
+                saved_at = data.get("_saved_at")
+                display_name = data.get("_display_name")
+            except Exception:
+                pass
+            if saved_at is None:
+                saved_at = f.stat().st_mtime
+            items.append({
+                "name": f.stem,
+                "display_name": display_name or f.stem,
+                "saved_at": float(saved_at),
+                "path": str(f),
+            })
+        except Exception:
+            continue
+    items.sort(key=lambda d: d["saved_at"], reverse=True)
+    return items
 
 
 def delete_project(name: str) -> bool:

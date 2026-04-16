@@ -68,95 +68,76 @@ class GenerationWorker(QThread):
         style_suffix = params.get_style_suffix()
 
         # Build the full prompt
+        original_prompt = params.prompt  # Before any enhancement
         full_prompt = params.prompt + style_suffix
 
-        # Ollama enhancement - with lazy initialization
-        print(f"\n{'='*60}")
-        print(f"[OLLAMA] Enhancement Status Check:")
-        print(f"[OLLAMA]   use_ollama checkbox: {params.use_ollama}")
-        print(f"[OLLAMA]   ollama_available: {state.ollama_available}")
-        print(f"[OLLAMA]   ollama_enhancer exists: {state.ollama_enhancer is not None}")
-        print(f"[OLLAMA]   ollama_manager exists: {state.ollama_manager is not None}")
+        print(f"[ORIGINAL] Input prompt: {original_prompt}")
 
-        # Lazy initialization: if enhancement is requested but Ollama isn't ready, initialize it
-        if params.use_ollama and (not state.ollama_available or state.ollama_enhancer is None):
-            print(f"[OLLAMA]   Ollama not initialized, attempting lazy init...")
-            self.progress.emit(0, params.batch_count, "Initializing Ollama...")
-            try:
-                from ollama_manager import OllamaManager
-                from ollama_prompts import PromptEnhancer
-                from core.settings import get_settings
-
-                settings = get_settings()
-                gpu_indices = settings.ollama_gpu_indices
-
-                # Filter out GPU 1 (Blackwell)
-                safe_gpus = [i for i in gpu_indices if i != 1] if isinstance(gpu_indices, list) else [0, 2]
-                if not safe_gpus:
-                    safe_gpus = [0]
-
-                print(f"[OLLAMA]   Using GPUs: {safe_gpus}")
-
-                if state.ollama_manager is None:
-                    print(f"[OLLAMA]   Creating OllamaManager...")
-                    state.ollama_manager = OllamaManager()
-                    state.ollama_available = True
-
-                if not state.ollama_manager.is_running():
-                    print(f"[OLLAMA]   Starting Ollama server...")
-                    success, msg = state.ollama_manager.start(gpu_indices=safe_gpus)
-                    if not success:
-                        print(f"[OLLAMA] ✗ FAILED to start Ollama: {msg}")
-                    else:
-                        print(f"[OLLAMA] ✓ Ollama server started")
-
-                if state.ollama_enhancer is None and state.ollama_manager.is_running():
-                    print(f"[OLLAMA]   Creating PromptEnhancer...")
-                    state.ollama_enhancer = PromptEnhancer()
-
-                print(f"[OLLAMA] ✓ Lazy initialization complete")
-            except ImportError as e:
-                print(f"[OLLAMA] ✗ FAILED - Import error: {e}")
-            except Exception as e:
-                print(f"[OLLAMA] ✗ FAILED to initialize: {e}")
-
-        if params.use_ollama and state.ollama_available and state.ollama_enhancer:
-            print(f"[OLLAMA] ✓ ENHANCEMENT ENABLED - Will enhance prompt")
-            print(f"[OLLAMA]   Model: {params.ollama_model}, Length: {params.ollama_length}, Complexity: {params.ollama_complexity}")
-            print(f"{'='*60}")
-            try:
-                print(f"[OLLAMA ENHANCE] ▶ STARTING with {params.ollama_model}...")
-                print(f"[OLLAMA ENHANCE]   Input ({len(full_prompt)} chars): {full_prompt[:80]}...")
-                self.progress.emit(0, params.batch_count, "Enhancing prompt with Ollama...")
-                enhanced = state.ollama_enhancer.enhance(
-                    full_prompt,
-                    length=params.ollama_length,
-                    complexity=params.ollama_complexity,
-                    model=params.ollama_model,
-                )
-                print(f"[OLLAMA ENHANCE] ✓ SUCCESS - Output ({len(enhanced)} chars): {enhanced[:80]}...")
-                full_prompt = enhanced
-            except Exception as e:
-                print(f"[OLLAMA ENHANCE] ✗ FAILED: {e}")
-                self.progress.emit(0, params.batch_count, f"Enhancement failed: {e}")
-        else:
-            print(f"[OLLAMA] ✗ ENHANCEMENT DISABLED - Reasons:")
-            if not params.use_ollama:
-                print(f"[OLLAMA]   - 'Enhance with Ollama' checkbox is OFF")
-            if not state.ollama_available:
-                print(f"[OLLAMA]   - Ollama modules not available/imported")
-            if not state.ollama_enhancer:
-                print(f"[OLLAMA]   - Ollama enhancer not initialized (click 'Enhance' button first to initialize)")
-            if not state.ollama_manager:
-                print(f"[OLLAMA]   - Ollama manager not created")
-            print(f"{'='*60}")
-
-        # Wildcard processing
+        # STEP 1: Resolve wildcards first (so LLM gets concrete text)
+        pre_wildcard = full_prompt
         if state.wildcard_available and state.wildcard_manager:
             try:
-                full_prompt = state.wildcard_manager.process(full_prompt)
+                resolved = state.wildcard_manager.process(full_prompt)
+                if resolved != full_prompt:
+                    print(f"[WILDCARD] Resolved: {resolved}")
+                full_prompt = resolved
             except Exception:
                 pass
+
+        # STEP 2: LM Studio enhancement (on wildcard-resolved prompt)
+        if params.use_ollama:
+            print(f"[LLM] Sending to LM Studio (model={params.ollama_model}, length={params.ollama_length}, complexity={params.ollama_complexity})")
+
+            try:
+                from ui.constants import get_lmstudio_url
+                from lmstudio_client import LMStudioClient
+                from ollama_prompts import get_enhance_system_prompt, strip_thinking_tags
+
+                lmstudio_url = get_lmstudio_url()
+                client = LMStudioClient(base_url=lmstudio_url)
+
+                if client.is_available():
+                    self.progress.emit(0, params.batch_count, "Enhancing prompt with LM Studio...")
+
+                    # Use custom system prompt if set
+                    from core.settings import get_settings
+                    custom_prompt = get_settings().enhance_system_prompt
+                    if custom_prompt:
+                        system_prompt = custom_prompt
+                    else:
+                        system_prompt = get_enhance_system_prompt(
+                            params.ollama_length, params.ollama_complexity
+                        )
+
+                    # High token budget for thinking models
+                    max_tokens_map = {
+                        "minimal": 4096, "short": 6000, "medium": 8192,
+                        "long": 10000, "detailed": 12000, "cinematic": 16000,
+                        "experimental": 16000,
+                    }
+                    max_tokens = max_tokens_map.get(params.ollama_length, 8192)
+
+                    response = client.generate(
+                        prompt=full_prompt,
+                        system=system_prompt,
+                        temperature=0.7,
+                        max_tokens=max_tokens,
+                    )
+
+                    enhanced = strip_thinking_tags(response.text) if response.text else ""
+                    if enhanced:
+                        print(f"[LLM] Enhanced result: {enhanced}")
+                        full_prompt = enhanced
+                    else:
+                        print(f"[LLM] Empty response, using pre-enhancement prompt")
+                else:
+                    print(f"[LLM] LM Studio not reachable at {lmstudio_url}")
+            except Exception as e:
+                print(f"[LLM] Enhancement failed: {e}")
+                self.progress.emit(0, params.batch_count, f"Enhancement failed: {e}")
+
+        # Log the exact prompt the AI renderer will receive
+        print(f"[FINAL PROMPT] {full_prompt}")
 
         # Create session directory
         from core.image_utils import get_session_dir
@@ -256,9 +237,15 @@ class GenerationWorker(QThread):
                         src_image_path=src_img,
                     )
                     result = image  # For type checking below
-                elif i2i_images and state.model_type in ("instruct", "distil"):
-                    # I2I with instruct/distil: file paths + bot_task
-                    print(f"[GEN] Running I2I mode with {len(i2i_images)} image(s), bot_task={params.bot_task}")
+                elif i2i_images and state.model_type in ("instruct", "distil", "nf4", "distil_nf4"):
+                    # I2I with instruct/distil/nf4: file paths + bot_task
+                    # Use think_recaption for I2I when bot_task is "image" (default).
+                    # Without think/recaption the model gets no internal analysis of the
+                    # input image, producing copy-paste artifacts instead of enhancements.
+                    i2i_bot_task = params.bot_task
+                    if i2i_bot_task == "image":
+                        i2i_bot_task = "think_recaption"
+                    print(f"[GEN] Running I2I mode with {len(i2i_images)} image(s), bot_task={i2i_bot_task}")
                     img_arg = i2i_images if len(i2i_images) > 1 else i2i_images[0]
                     result = model.generate_image(
                         prompt=full_prompt,
@@ -266,14 +253,14 @@ class GenerationWorker(QThread):
                         image=img_arg,
                         image_size="auto",
                         use_system_prompt="en_vanilla",
-                        bot_task=params.bot_task,
+                        bot_task=i2i_bot_task,
                         infer_align_image_size=True,
                         diff_infer_steps=steps,
                         diff_guidance_scale=params.guidance_scale,
                     )
-                elif state.model_type in ("instruct", "distil"):
-                    # T2I with instruct/distil: supports bot_task/think
-                    print(f"[GEN] Running T2I mode (instruct/distil) bot_task={params.bot_task}")
+                elif state.model_type in ("instruct", "distil", "nf4", "distil_nf4"):
+                    # T2I with instruct/distil/nf4: supports bot_task/think
+                    print(f"[GEN] Running T2I mode (instruct/distil/nf4) bot_task={params.bot_task}")
                     result = model.generate_image(
                         prompt=full_prompt,
                         seed=current_seed,
@@ -327,12 +314,15 @@ class GenerationWorker(QThread):
 
                 # Save JSON sidecar
                 config = params.to_metadata()
-                config.update({
-                    "full_prompt": full_prompt,
-                    "seed": current_seed,
-                    "generation_time": gen_time,
-                    "model_type": state.model_type,
-                })
+                config["prompt"] = original_prompt
+                config["full_prompt"] = full_prompt
+                config["enhanced_prompt"] = (
+                    full_prompt if full_prompt != original_prompt + style_suffix
+                    else None
+                )
+                config["seed"] = current_seed
+                config["generation_time"] = gen_time
+                config["model_type"] = state.model_type
                 if cot_text:
                     config["cot_text"] = cot_text
 

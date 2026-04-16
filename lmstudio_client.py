@@ -64,9 +64,14 @@ class LMStudioClient:
         system: Optional[str] = None,
         model: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 1024,
+        max_tokens: int = 8192,
     ) -> LMStudioResponse:
-        """Generate text using LM Studio's chat completions API"""
+        """Generate text using LM Studio's chat completions API.
+
+        For thinking models, max_tokens is the *total* budget including
+        both reasoning and the visible answer. Set it high enough so the
+        model has room to think AND produce a response.
+        """
 
         messages = []
         if system:
@@ -76,7 +81,10 @@ class LMStudioClient:
         payload = {
             "messages": messages,
             "temperature": temperature,
+            # Send both — LM Studio uses whichever it supports.
+            # max_completion_tokens is the OpenAI standard for thinking models.
             "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
             "stream": False
         }
 
@@ -97,7 +105,36 @@ class LMStudioClient:
                 text = ""
                 if choices:
                     message = choices[0].get('message', {})
-                    text = message.get('content', '').strip()
+                    finish_reason = choices[0].get('finish_reason', '')
+
+                    # Log raw structure for debugging
+                    logger.info(f"LM Studio message keys: {list(message.keys())}")
+                    logger.info(f"LM Studio finish_reason: {finish_reason}")
+
+                    # Content is the actual answer (may be null for thinking models
+                    # that exhausted their token budget on thinking)
+                    text = (message.get('content') or '').strip()
+
+                    # reasoning_content is the thinking — NOT the answer.
+                    # Log it for debugging but don't use it as the response.
+                    reasoning = (message.get('reasoning_content') or '').strip()
+                    if reasoning:
+                        logger.info(
+                            f"LM Studio thinking ({len(reasoning)} chars, "
+                            f"answer: {len(text)} chars)"
+                        )
+
+                    if not text and reasoning:
+                        logger.warning(
+                            "Content is empty but reasoning_content has text. "
+                            "The model likely ran out of tokens during thinking. "
+                            "Try increasing max_tokens."
+                        )
+
+                    if text:
+                        logger.info(f"LM Studio response ({len(text)} chars): {text[:100]}...")
+                    else:
+                        logger.warning(f"LM Studio returned empty content.")
 
                 return LMStudioResponse(
                     text=text,
@@ -150,6 +187,56 @@ def check_lmstudio_available() -> bool:
         return response.status_code == 200
     except:
         return False
+
+
+def discover_lmstudio(subnet: str = None, port: int = 1234, timeout: float = 0.5) -> Optional[str]:
+    """Scan the local network for an LM Studio server.
+
+    Args:
+        subnet: e.g. "192.168.50" — if None, auto-detects from local IPs
+        port: LM Studio port (default 1234)
+        timeout: connection timeout per host in seconds
+
+    Returns:
+        URL string like "http://192.168.50.27:1234" or None
+    """
+    import socket
+    import concurrent.futures
+
+    # Auto-detect subnet from local network interfaces
+    if subnet is None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            subnet = ".".join(local_ip.split(".")[:3])
+        except Exception:
+            subnet = "192.168.1"
+
+    def _check(ip):
+        url = f"http://{ip}:{port}"
+        try:
+            r = requests.get(f"{url}/v1/models", timeout=timeout)
+            if r.status_code == 200:
+                return url
+        except Exception:
+            pass
+        return None
+
+    # Also check localhost
+    candidates = [f"{subnet}.{i}" for i in range(1, 255)] + ["127.0.0.1", "localhost"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+        futures = {pool.submit(_check, ip): ip for ip in candidates}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                # Cancel remaining work
+                for f in futures:
+                    f.cancel()
+                return result
+    return None
 
 
 def get_lmstudio_model() -> Optional[str]:

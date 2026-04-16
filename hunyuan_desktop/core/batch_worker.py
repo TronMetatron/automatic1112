@@ -242,6 +242,8 @@ class BatchWorker(QThread):
                         if style_suffix:
                             full_prompt += style_suffix
 
+                        print(f"[ORIGINAL] #{total_count+1}: {theme}")
+
                         # Generate seed
                         if config.random_seeds:
                             current_seed = random.randint(0, 2**31 - 1)
@@ -250,9 +252,10 @@ class BatchWorker(QThread):
                                           + theme_idx * 1000
                                           + img_idx)
 
-                        # PHASE 1: Starred wildcard pre-processing
+                        # PHASE 1: Wildcard resolution (before LLM enhancement)
                         starred_placeholders = {}
                         has_starred = False
+                        pre_wildcard = full_prompt
 
                         if state.wildcard_available and state.wildcard_manager:
                             try:
@@ -286,10 +289,13 @@ class BatchWorker(QThread):
                                     full_prompt = state.wildcard_manager.process_prompt(
                                         full_prompt, generation_index=total_count
                                     )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                print(f"[BATCH] Wildcard processing error: {e}")
 
-                        # PHASE 2: Ollama enhancement with protected tokens
+                        if full_prompt != pre_wildcard:
+                            print(f"[WILDCARD] #{total_count+1} resolved: {full_prompt}")
+
+                        # PHASE 2: LLM enhancement (after wildcards resolved)
                         if config.enhance and state.ollama_available and state.ollama_enhancer:
                             try:
                                 actual_length = config.ollama_length
@@ -315,7 +321,7 @@ class BatchWorker(QThread):
                                     )
                                     input_for_ollama = f"{instruction}\n\nORIGINAL PROMPT:\n{full_prompt}"
 
-                                print(f"[BATCH ENHANCE] ▶ Item {total_count+1}: {input_for_ollama[:60]}...")
+                                print(f"[LLM] #{total_count+1} sending to LM Studio (length={actual_length}, complexity={actual_complexity})")
                                 enhanced = state.ollama_enhancer.enhance(
                                     input_for_ollama,
                                     length=str(actual_length),
@@ -336,14 +342,14 @@ class BatchWorker(QThread):
                                 if "ORIGINAL PROMPT:" in clean:
                                     clean = clean.split("ORIGINAL PROMPT:")[-1].strip()
 
-                                print(f"[BATCH ENHANCE] ✓ Item {total_count+1}: {clean[:60]}...")
+                                print(f"[LLM] #{total_count+1} enhanced: {clean}")
                                 full_prompt = clean
                             except Exception as e:
-                                print(f"[BATCH ENHANCE] ✗ Item {total_count+1} FAILED: {e}")
+                                print(f"[LLM] #{total_count+1} FAILED: {e}")
                         elif config.enhance:
                             # Enhancement requested but not available
                             if total_count == 0:  # Only log once
-                                print(f"[BATCH ENHANCE] ✗ SKIPPING - Enhancement requested but Ollama not ready")
+                                print(f"[LLM] Enhancement requested but LM Studio not ready")
 
                         # PHASE 3: Generate starred variations
                         starred_variations = []
@@ -397,9 +403,8 @@ class BatchWorker(QThread):
                             try:
                                 start_time = time.time()
                                 print(f"[BATCH] Generating image {total_count+1}/{total_images}...")
-                                print(f"[BATCH]   model_type: {state.model_type}")
-                                print(f"[BATCH]   steps: {steps}, image_size: {image_size}")
-                                print(f"[BATCH]   bot_task: {config.bot_task}, seed: {current_seed}")
+                                print(f"[BATCH]   model_type: {state.model_type}, steps: {steps}, size: {image_size}, seed: {current_seed}")
+                                print(f"[FINAL PROMPT] #{total_count+1}: {var_prompt}")
 
                                 # Use the appropriate generation path for the model
                                 cot_text = None
@@ -470,7 +475,7 @@ class BatchWorker(QThread):
                                         guidance_scale=config.guidance_scale,
                                     )
                                     result = image
-                                elif state.model_type in ("instruct", "distil"):
+                                elif state.model_type in ("instruct", "distil", "nf4", "distil_nf4"):
                                     result = model.generate_image(
                                         prompt=var_prompt,
                                         seed=current_seed,
@@ -526,9 +531,14 @@ class BatchWorker(QThread):
                                     image.save(str(filepath))
 
                                     # Save JSON sidecar
+                                    # Track whether enhancement changed the prompt
+                                    base_prompt = theme + (DEFAULT_STYLE_PRESETS.get(style, ""))
+                                    was_enhanced = var_prompt != base_prompt
+
                                     img_config = {
                                         "prompt": theme,
                                         "full_prompt": var_prompt,
+                                        "enhanced_prompt": var_prompt if was_enhanced else None,
                                         "negative_prompt": config.negative_prompt,
                                         "style": style,
                                         "aspect_ratio": config.aspect_ratio,

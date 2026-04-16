@@ -12,14 +12,132 @@ from typing import Generator
 from ui.state import get_state
 from ui.constants import MODEL_PATHS, MODEL_INFO, is_int8_model, is_firered_model
 
-# Compat aliases for removed constants (deepgen/firered not available on this machine)
+# Compat aliases
 MODEL_PATH = MODEL_PATHS.get("base", "")
 DEEPGEN_REPO = None
 DEEPGEN_CHECKPOINTS = None
-FIRERED_MODEL = None
+FIRERED_MODEL = MODEL_PATHS.get("firered", None)
 
 # Prevent CUDA memory fragmentation (critical for large models)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+
+def _patch_nf4_dual_gpu_device_alignment(model):
+    """Wrap image-token instantiation methods so cross-device tensor ops
+    don't blow up with 'tensors on different devices'.
+
+    Under our dual-GPU NF4 device map, VAE / vision submodules live on the
+    secondary GPU while the main transformer (and hidden_states) live on the
+    primary. Many functions in the Hunyuan model do raw tensor ops (scatter,
+    masked_select, arithmetic) between tensors produced on different devices.
+    This patch wraps the relevant methods to move tensors to the right
+    device at each boundary.
+    """
+    import torch
+
+    # Device where vision_model's weights live (usually secondary GPU)
+    try:
+        vision_device = next(model.vision_model.parameters()).device
+    except Exception:
+        vision_device = None
+
+    def _to(target, t):
+        if t is None or target is None:
+            return t
+        if isinstance(t, torch.Tensor) and t.device != target:
+            return t.to(target)
+        return t
+
+    # --- instantiate_vae_image_tokens ---
+    orig_vae = model.instantiate_vae_image_tokens
+
+    def patched_vae(hidden_states, timesteps, images, image_mask,
+                    guidance=None, timesteps_r=None):
+        tgt = hidden_states.device if hidden_states is not None else None
+        image_mask = _to(tgt, image_mask)
+        if isinstance(timesteps, torch.Tensor):
+            timesteps = _to(tgt, timesteps)
+        guidance = _to(tgt, guidance)
+        timesteps_r = _to(tgt, timesteps_r)
+        return orig_vae(hidden_states, timesteps, images, image_mask,
+                        guidance=guidance, timesteps_r=timesteps_r)
+
+    model.instantiate_vae_image_tokens = patched_vae
+
+    # --- _forward_vision_encoder: move inputs to vision_device, output back ---
+    # The caller (instantiate_vit_image_tokens) sets model._vit_target_device
+    # so we know where to put the output tensor.
+    orig_fve = model._forward_vision_encoder
+
+    def patched_fve(images, **image_kwargs):
+        if vision_device is not None:
+            images = _to(vision_device, images)
+            image_kwargs = {
+                k: _to(vision_device, v) for k, v in image_kwargs.items()
+            }
+        out = orig_fve(images, **image_kwargs)
+        tgt = getattr(model, "_vit_target_device", None)
+        if isinstance(out, torch.Tensor):
+            out = _to(tgt, out)
+        return out
+
+    model._forward_vision_encoder = patched_fve
+
+    # --- instantiate_vit_image_tokens ---
+    orig_vit = model.instantiate_vit_image_tokens
+
+    def patched_vit(hidden_states, images, image_masks, image_kwargs):
+        tgt = hidden_states.device if hidden_states is not None else None
+        image_masks = _to(tgt, image_masks)
+        # Stash target device for patched_fve to read
+        model._vit_target_device = tgt
+        try:
+            return orig_vit(hidden_states, images, image_masks, image_kwargs)
+        finally:
+            model._vit_target_device = None
+
+    model.instantiate_vit_image_tokens = patched_vit
+
+    # --- ragged_final_layer ---
+    orig_rfl = model.ragged_final_layer
+
+    def patched_rfl(hidden_states, image_mask, timesteps,
+                    token_h, token_w, first_step=None):
+        tgt = hidden_states.device if hidden_states is not None else None
+        image_mask = _to(tgt, image_mask)
+        if isinstance(timesteps, torch.Tensor):
+            timesteps = _to(tgt, timesteps)
+        return orig_rfl(hidden_states, image_mask, timesteps,
+                        token_h, token_w, first_step=first_step)
+
+    model.ragged_final_layer = patched_rfl
+
+    # --- instantiate_continuous_tokens / guidance_tokens / timestep_r_tokens ---
+    # All three do scatter_(index=..., src=self.<emb>(...)) where hidden_states
+    # and the embedding submodule live on the primary GPU but the *_index /
+    # timesteps tensors may arrive from other devices.
+    def _wrap_scatter_method(method_name):
+        orig = getattr(model, method_name)
+
+        def patched(hidden_states, values=None, indices=None):
+            tgt = hidden_states.device if hidden_states is not None else None
+
+            def _coerce(t):
+                if isinstance(t, torch.Tensor):
+                    return _to(tgt, t)
+                if isinstance(t, list):
+                    return [_coerce(x) for x in t]
+                return t
+
+            return orig(hidden_states, _coerce(values), _coerce(indices))
+
+        setattr(model, method_name, patched)
+
+    _wrap_scatter_method("instantiate_continuous_tokens")
+    _wrap_scatter_method("instantiate_guidance_tokens")
+    _wrap_scatter_method("instantiate_timestep_r_tokens")
+    print(f"[LOAD] NF4 dual-GPU device-alignment patch applied "
+          f"(vision_device={vision_device})")
 
 
 def load_model(model_type: str = None) -> Generator[str, None, None]:
@@ -99,21 +217,32 @@ def load_model(model_type: str = None) -> Generator[str, None, None]:
             print(f"[LOAD] GPU {gpu_idx} memory: {mem_allocated:.1f}GB allocated, {mem_reserved:.1f}GB reserved, {mem_total:.1f}GB total")
 
             if mem_reserved > 30:  # More than 30GB suggests model is already loaded
-                yield f"ERROR: GPU {gpu_idx} already has {mem_reserved:.1f}GB reserved!"
-                yield f"This usually means a model is loaded or a previous load failed."
-                yield f"Click 'Unload Model' to free memory, or restart the app if that doesn't work."
-                # Reset state in case it's inconsistent
-                if not state.model_loaded:
-                    state.model_loaded = False
-                    state.model = None
-                return
+                # Check if this is a kept-alive model from a previous session
+                from core.settings import get_settings
+                settings = get_settings()
+                if settings.keep_model_loaded and settings.last_model_type == model_type:
+                    yield f"Detected {mem_reserved:.1f}GB on GPU — re-attaching to {model_info['name']}..."
+                    print(f"[LOAD] Re-attaching to model kept in VRAM ({mem_reserved:.1f}GB reserved)")
+                    # Reset the flag so next quit asks again
+                    settings.keep_model_loaded = False
+                else:
+                    yield f"ERROR: GPU {gpu_idx} already has {mem_reserved:.1f}GB reserved!"
+                    yield f"This usually means a model is loaded or a previous load failed."
+                    yield f"Click 'Unload Model' to free memory, or restart the app if that doesn't work."
+                    if not state.model_loaded:
+                        state.model_loaded = False
+                        state.model = None
+                    return
 
         print(f"[LOAD] Loading {model_info['name']}...")
         yield f"Step 1: Importing libraries for {model_info['name']}..."
         from transformers import AutoModelForCausalLM
 
-        print("[LOAD] Importing SDNQ...")
-        from sdnq import SDNQConfig  # Registers SDNQ into transformers
+        is_nf4 = model_type in ("nf4", "distil_nf4")
+
+        if not is_nf4:
+            print("[LOAD] Importing SDNQ...")
+            from sdnq import SDNQConfig  # Registers SDNQ into transformers
 
         model_id = str(model_path)
 
@@ -144,52 +273,129 @@ def load_model(model_type: str = None) -> Generator[str, None, None]:
         print(f"[LOAD] Loading model from {model_id} to {device}...")
         print(f"[LOAD] Selected GPU {gpu_index}, mapped to {device} ({visible_device_count} visible)")
 
-        # Dual-GPU strategy with patched model (bridge patch fixes device mismatch):
-        # VAE + vision on secondary GPU (small, no MoE spikes)
-        # All 32 transformer layers + diffusion on primary GPU (handles MoE activation spikes)
-        # KV cache cleared between text gen and diffusion phases (patched in model code)
-        #
-        # Tested: 11 min total, ~5.2s/step diffusion, peak 93.3GB/95GB on Blackwell
         num_gpus = torch.cuda.device_count()
-        if num_gpus >= 2:
+
+        if is_nf4:
+            # NF4 4-bit BitsAndBytes quantization. Default: single 48GB GPU.
+            # Optional dual-GPU split: VAE + vision on secondary GPU to free
+            # VRAM on the primary for multi-image I2I conditioning.
             gpu_sizes = [(i, torch.cuda.get_device_properties(i).total_memory / (1024**3))
                          for i in range(num_gpus)]
             gpu_sizes.sort(key=lambda x: x[1], reverse=True)
-            primary_idx = gpu_sizes[0][0]
-            secondary_idx = gpu_sizes[1][0]
+            largest_gpu = gpu_sizes[0][0]
+            target_device = f"cuda:{largest_gpu}"
+            device_index = largest_gpu
 
-            custom_device_map = {
-                "vae": secondary_idx,
-                "vision_model": secondary_idx,
-                "vision_aligner": secondary_idx,
-                "model": primary_idx,
-                "patch_embed": primary_idx,
-                "timestep_emb": primary_idx,
-                "time_embed": primary_idx,
-                "time_embed_2": primary_idx,
-                "final_layer": primary_idx,
-                "lm_head": primary_idx,
-            }
+            from core.settings import get_settings
+            use_nf4_dual = get_settings().nf4_dual_gpu and num_gpus >= 2
 
-            primary_name = torch.cuda.get_device_name(primary_idx)
-            secondary_name = torch.cuda.get_device_name(secondary_idx)
-            yield f"Step 2: Loading {model_info['name']} dual-GPU ({primary_name} + {secondary_name})..."
-            print(f"[LOAD] Dual-GPU: transformer layers on GPU {primary_idx}, VAE+vision on GPU {secondary_idx}")
+            from transformers import BitsAndBytesConfig
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
 
-            load_kwargs = dict(device_map=custom_device_map)
+            if use_nf4_dual:
+                secondary_idx = gpu_sizes[1][0]
+                primary_name = torch.cuda.get_device_name(largest_gpu)
+                secondary_name = torch.cuda.get_device_name(secondary_idx)
+                # Mirror SDNQ split: keep transformer/diffusion bulk on primary,
+                # offload smaller vision/VAE pieces to the secondary GPU.
+                custom_device_map = {
+                    "vae": secondary_idx,
+                    "vision_model": secondary_idx,
+                    "vision_aligner": secondary_idx,
+                    "model": largest_gpu,
+                    "patch_embed": largest_gpu,
+                    "timestep_emb": largest_gpu,
+                    "timestep_r_emb": largest_gpu,
+                    "guidance_emb": largest_gpu,
+                    "time_embed": largest_gpu,
+                    "time_embed_2": largest_gpu,
+                    "final_layer": largest_gpu,
+                    "lm_head": largest_gpu,
+                }
+                yield (f"Step 2: Loading {model_info['name']} NF4 dual-GPU "
+                       f"({primary_name} + {secondary_name})...")
+                print(f"[LOAD] NF4 dual-GPU: transformer on GPU {largest_gpu}, "
+                      f"VAE+vision on GPU {secondary_idx}")
+                load_kwargs = dict(device_map=custom_device_map)
+            else:
+                yield f"Step 2: Loading {model_info['name']} NF4 on {torch.cuda.get_device_name(largest_gpu)}..."
+                print(f"[LOAD] NF4 single-GPU: loading to GPU {largest_gpu} "
+                      f"({torch.cuda.get_device_name(largest_gpu)})")
+                load_kwargs = dict(device_map=target_device)
+
+            state.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=quant_config,
+                attn_implementation="sdpa",
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+                low_cpu_mem_usage=True,
+                **load_kwargs,
+            )
+
+            # Dual-GPU NF4: patch the model's multimodal token instantiation
+            # methods so image_mask tensors get coerced to hidden_states.device
+            # before bare (un-hooked) tensor ops like `index.masked_select(mask)`.
+            # Without this, multi-image I2I fails with "tensors on different
+            # devices" when the VAE / vision submodules live on a different GPU
+            # than the main transformer. Safe no-op for single-GPU.
+            if use_nf4_dual:
+                _patch_nf4_dual_gpu_device_alignment(state.model)
         else:
-            yield f"Step 2: Loading {model_info['name']} on {device}..."
-            load_kwargs = dict(device_map=device)
+            # SDNQ models — dual-GPU strategy with patched model (bridge patch fixes device mismatch):
+            # VAE + vision on secondary GPU (small, no MoE spikes)
+            # All 32 transformer layers + diffusion on primary GPU (handles MoE activation spikes)
+            # KV cache cleared between text gen and diffusion phases (patched in model code)
+            #
+            # Tested: 11 min total, ~5.2s/step diffusion, peak 93.3GB/95GB on Blackwell
+            if num_gpus >= 2:
+                gpu_sizes = [(i, torch.cuda.get_device_properties(i).total_memory / (1024**3))
+                             for i in range(num_gpus)]
+                gpu_sizes.sort(key=lambda x: x[1], reverse=True)
+                primary_idx = gpu_sizes[0][0]
+                secondary_idx = gpu_sizes[1][0]
 
-        state.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            attn_implementation="sdpa",
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            moe_impl="eager",
-            local_files_only=True,
-            **load_kwargs,
-        )
+                custom_device_map = {
+                    "vae": secondary_idx,
+                    "vision_model": secondary_idx,
+                    "vision_aligner": secondary_idx,
+                    "model": primary_idx,
+                    "patch_embed": primary_idx,
+                    "timestep_emb": primary_idx,
+                    "timestep_r_emb": primary_idx,   # Distil model only
+                    "guidance_emb": primary_idx,      # Distil model only
+                    "time_embed": primary_idx,
+                    "time_embed_2": primary_idx,
+                    "final_layer": primary_idx,
+                    "lm_head": primary_idx,
+                }
+
+                primary_name = torch.cuda.get_device_name(primary_idx)
+                secondary_name = torch.cuda.get_device_name(secondary_idx)
+                yield f"Step 2: Loading {model_info['name']} dual-GPU ({primary_name} + {secondary_name})..."
+                print(f"[LOAD] Dual-GPU: transformer layers on GPU {primary_idx}, VAE+vision on GPU {secondary_idx}")
+
+                load_kwargs = dict(device_map=custom_device_map)
+            else:
+                yield f"Step 2: Loading {model_info['name']} on {device}..."
+                load_kwargs = dict(device_map=device)
+
+            state.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                attn_implementation="sdpa",
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                moe_impl="eager",
+                local_files_only=True,
+                low_cpu_mem_usage=True,
+                **load_kwargs,
+            )
 
         # Log device distribution
         if hasattr(state.model, 'hf_device_map'):
@@ -202,10 +408,15 @@ def load_model(model_type: str = None) -> Generator[str, None, None]:
         yield "Step 3: Model weights loaded, configuring..."
 
         # Instruct/Distil model specific setup
-        if model_type in ("instruct", "distil"):
+        if model_type in ("instruct", "distil", "nf4", "distil_nf4"):
             yield f"Step 4: Configuring {model_info['name']}..."
-            
-            # Patch generation_config for Instruct/Distil model
+
+            # Patch generation_config for Instruct/Distil/NF4 model
+            # CRITICAL: sequence_template must be "instruct" for instruct-tuned models.
+            # SDNQ quantized models ship with "pretrain" which causes malformed input
+            # (no system/user/assistant framing), breaking think/recaption and I2I quality.
+            state.model.generation_config.sequence_template = "instruct"
+
             # use_system_prompt must be a valid type: en_vanilla, en_recaption, en_think_recaption, dynamic, custom
             # "None" causes get_system_prompt to return None which breaks .strip()
             if not hasattr(state.model.generation_config, 'use_system_prompt'):
@@ -214,9 +425,9 @@ def load_model(model_type: str = None) -> Generator[str, None, None]:
                 state.model.generation_config.bot_task = "image"
             if not hasattr(state.model.generation_config, 'drop_think'):
                 state.model.generation_config.drop_think = False
-            
+
             # Set default steps based on model type
-            default_steps = 8 if model_type == "distil" else 50
+            default_steps = 8 if model_type in ("distil", "distil_nf4") else 50
             if not hasattr(state.model.generation_config, 'diff_infer_steps'):
                 state.model.generation_config.diff_infer_steps = default_steps
             if not hasattr(state.model.generation_config, 'diff_guidance_scale'):
@@ -1037,11 +1248,18 @@ def generate_firered(model, prompt, seed, width, height, steps, true_cfg_scale,
         out_width = round(width / 8) * 8
         out_height = round(height / 8) * 8
 
+    # Pipeline requires an image — for T2I, create a blank canvas
+    if not images:
+        t2i_w = out_width or 1024
+        t2i_h = out_height or 1024
+        images = [PILImage.new("RGB", (t2i_w, t2i_h), (255, 255, 255))]
+        print(f"[FIRERED] T2I mode: using blank {t2i_w}x{t2i_h} canvas")
+
     # Determine device for generator
     device = model.device if hasattr(model, 'device') else "cuda"
 
     inputs = {
-        "image": images if images else None,
+        "image": images,
         "prompt": prompt,
         "height": out_height,
         "width": out_width,
@@ -1311,6 +1529,7 @@ def get_available_model_types() -> list:
         ("HunyuanImage-3.0 Instruct (T2I + I2I)", "instruct"),
         ("HunyuanImage-3.0 Instruct-Distil (Fast T2I + I2I)", "distil"),
         ("DeepGen 1.0 Unified (T2I + I2I, 5B)", "deepgen"),
+        ("FireRed 1.1 Image Edit (T2I + I2I)", "firered"),
         ("Base INT8 (T2I, 96GB GPU)", "base_int8"),
         ("Instruct INT8 (T2I + I2I, 96GB GPU)", "instruct_int8"),
         ("Distil INT8 (Fast T2I + I2I, 96GB GPU)", "distil_int8"),

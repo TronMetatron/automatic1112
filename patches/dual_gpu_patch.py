@@ -195,7 +195,7 @@ def patch_hf_cache():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Apply dual-GPU patches to HunyuanImage-3.0")
-    parser.add_argument("--model-dir", default="/home/james/hun3d/HunyuanImage3-Instruct-SDNQ",
+    parser.add_argument("--model-dir", required=True,
                         help="Path to model directory")
     parser.add_argument("--cache-only", action="store_true",
                         help="Only patch HF cache, not the model directory")

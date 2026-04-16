@@ -1,8 +1,8 @@
-# HunyuanImage-3.0 Desktop — Setup & Dual-GPU Guide
+# Automatic1112 — Setup & Dual-GPU Guide
 
 ## Overview
 
-This is a PySide6 desktop application for AI image generation using Tencent's HunyuanImage-3.0 model (80B parameter Mixture-of-Experts, SDNQ uint4 quantized). It supports text-to-image, image editing, think/recaption modes, and batch generation with LLM prompt enhancement via LM Studio.
+Automatic1112 is a PySide6 desktop application for AI image generation using Tencent's HunyuanImage-3.0 model (80B parameter Mixture-of-Experts, SDNQ uint4 quantized). It supports text-to-image, image editing, think/recaption modes, and batch generation with LLM prompt enhancement via LM Studio.
 
 ## Hardware Requirements
 
@@ -27,65 +27,75 @@ The 35GB spike comes from the Mixture-of-Experts gating function creating large 
 
 ## Installation
 
-### 1. Clone/Copy the Project
+### 1. Clone the Repository
 
 ```bash
-# Project structure:
-/home/james/hunyuan_desktop/     # Desktop app (standalone)
-/home/james/hun3d/               # Models + web UI + shared venv
+git clone https://github.com/YOUR_USERNAME/automatic1112.git
+cd automatic1112
 ```
 
 ### 2. Install System Dependencies
 
+**Linux (Ubuntu/Debian):**
 ```bash
 sudo apt install -y python3.12-venv python3.12-dev libxcb-cursor0
 ```
 
+**Windows:**
+- Install [Python 3.12](https://www.python.org/downloads/)
+- Install [CUDA Toolkit 12.8](https://developer.nvidia.com/cuda-downloads)
+
 ### 3. Create Python Environment
 
 ```bash
-cd /home/james/hun3d
-python3 -m venv hunyuan_env
-source hunyuan_env/bin/activate
+python3 -m venv venv
+source venv/bin/activate   # Linux
+# venv\Scripts\activate    # Windows
 
 # PyTorch with CUDA 12.8
 pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
     --index-url https://download.pytorch.org/whl/cu128
 
 # Dependencies
-pip install "transformers==4.57.3" "accelerate" "gradio>=4.21.0" \
-    "einops>=0.8.0" "numpy==1.26.4" "pillow==11.3.0" \
-    "diffusers>=0.32.0" "safetensors==0.4.5" "tokenizers>=0.21.0" \
-    "huggingface_hub[cli]" "sdnq>=0.1.4" psutil PySide6
+pip install -r requirements.txt
 ```
 
 > **Important**: Use `transformers==4.57.3` — newer versions (5.x) have incompatible Cache API changes that cause errors with this model's custom code.
 
-### 4. Download Models
+### 4. Set Model Directory
+
+```bash
+# Linux
+export A1112_MODEL_DIR="$HOME/automatic1112_models"
+
+# Windows
+set A1112_MODEL_DIR=%USERPROFILE%\automatic1112_models
+```
+
+### 5. Download Models
 
 Download from HuggingFace (requires ~48GB each):
 
 ```bash
 # Base model (text-to-image only, fastest)
 huggingface-cli download Disty0/HunyuanImage3-SDNQ-uint4-svd-r32 \
-    --local-dir /home/james/hun3d/HunyuanImage3-SDNQ
+    --local-dir "$A1112_MODEL_DIR/HunyuanImage3-SDNQ"
 
 # Instruct model (text-to-image + image editing + think/recaption)
 huggingface-cli download Disty0/HunyuanImage3-Instruct-SDNQ \
-    --local-dir /home/james/hun3d/HunyuanImage3-Instruct-SDNQ
+    --local-dir "$A1112_MODEL_DIR/HunyuanImage3-Instruct-SDNQ"
 
 # Distil model (fast generation, 8 steps)
 huggingface-cli download Disty0/HunyuanImage3-Instruct-Distil-SDNQ \
-    --local-dir /home/james/hun3d/HunyuanImage3-Distil-SDNQ
+    --local-dir "$A1112_MODEL_DIR/HunyuanImage3-Distil-SDNQ"
 ```
 
-### 5. Apply Dual-GPU Patches (Required for multi-GPU setups)
+### 6. Apply Dual-GPU Patches (Required for multi-GPU setups)
 
 The model's custom code has device mismatch issues when components are split across GPUs. These patches fix that:
 
 ```bash
-cd /home/james/hunyuan_desktop
-python patches/dual_gpu_patch.py --model-dir /home/james/hun3d/HunyuanImage3-Instruct-SDNQ
+python patches/dual_gpu_patch.py --model-dir "$A1112_MODEL_DIR/HunyuanImage3-Instruct-SDNQ"
 ```
 
 This patches `modeling_hunyuan_image_3.py` to:
@@ -95,14 +105,16 @@ This patches `modeling_hunyuan_image_3.py` to:
 
 Originals are backed up as `modeling_hunyuan_image_3.py.orig`.
 
-### 6. Launch
+### 7. Launch
 
+**Linux:**
 ```bash
-# Desktop app
 ./launch_desktop.sh
+```
 
-# Or the web UI (Gradio)
-cd /home/james/hun3d && ./launch_ui.sh
+**Windows:**
+```cmd
+launch_desktop.bat
 ```
 
 ## GPU Configuration
@@ -185,24 +197,24 @@ Instruct model, think_recaption mode, 1024x1024, 50 steps:
 
 ## Prompt Enhancement
 
-The desktop app uses **LM Studio** on a remote machine for prompt enhancement (no local GPU usage for LLM):
+The app uses **LM Studio** or **Ollama** for prompt enhancement (no local GPU usage for LLM):
 
-- **URL**: Configured in `ui/constants.py` → `LMSTUDIO_URL`
+- **URL**: Configurable via `A1112_LMSTUDIO_URL` env var, app settings, or `ui/constants.py`
 - **Protocol**: OpenAI-compatible API (`/v1/chat/completions`)
-- **Default**: `http://192.168.50.30:1234`
-
-To use local Ollama instead, modify `hunyuan_desktop/core/ollama_worker.py` to use `OllamaManager` instead of `LMStudioClient`.
+- **Default**: `http://localhost:1234`
 
 ## Project Structure
 
 ```
-hunyuan_desktop/
-├── launch_desktop.sh          # Launch script
-├── test_headless.py           # Headless test script (no Qt UI needed)
+automatic1112/
+├── launch_desktop.sh / .bat   # Platform launchers
+├── hunyuan_cli.sh / .bat      # CLI launchers
+├── requirements.txt           # Python dependencies
 ├── patches/
 │   └── dual_gpu_patch.py      # Applies dual-GPU patches to model code
 ├── hunyuan_desktop/           # PySide6 desktop app package
 │   ├── main.py                # Entry point
+│   ├── cli.py                 # Headless CLI
 │   ├── core/
 │   │   ├── app_state.py       # Qt state wrapper
 │   │   ├── model_manager.py   # Model loading with dual-GPU support
@@ -219,21 +231,14 @@ hunyuan_desktop/
 │   ├── theme/                 # Dark theme
 │   └── dialogs/               # Editor dialogs
 ├── ui/
-│   ├── constants.py           # Model paths, presets, LM Studio URL
+│   ├── constants.py           # Model paths, presets, config
 │   └── state.py               # Global app state, GPU detection
 ├── ollama_prompts.py          # Prompt enhancement logic
 ├── lmstudio_client.py         # LM Studio API client
-├── wildcard_utils.py          # Wildcard template system
-└── HunyuanImage-3.0/         # Original model code (for sdnq module)
-
-hun3d/                         # Shared models + web UI
-├── HunyuanImage3-SDNQ/       # Base model (48GB, 11 shards)
-├── HunyuanImage3-Instruct-SDNQ/  # Instruct model (48GB, 11 shards)
-├── HunyuanImage3-Distil-SDNQ/    # Distil model (48GB, 11 shards)
-├── hunyuan_env/               # Shared Python virtual environment
-├── hunyuan_ui.py              # Gradio web UI
-└── launch_ui.sh               # Web UI launcher
+└── wildcard_utils.py          # Wildcard template system
 ```
+
+Model weights are stored separately in your `A1112_MODEL_DIR` (default: `~/automatic1112_models`).
 
 ## Troubleshooting
 
@@ -247,7 +252,7 @@ The MoE activation spike needs ~35GB free VRAM beyond model weights. Solutions:
 ### "Expected all tensors to be on the same device"
 The dual-GPU patches haven't been applied. Run:
 ```bash
-python patches/dual_gpu_patch.py --model-dir /path/to/HunyuanImage3-Instruct-SDNQ
+python patches/dual_gpu_patch.py --model-dir "$A1112_MODEL_DIR/HunyuanImage3-Instruct-SDNQ"
 ```
 
 Also clear the HuggingFace cache if the model was loaded before patching:

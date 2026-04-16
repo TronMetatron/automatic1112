@@ -95,6 +95,28 @@ class AppSettings:
         import json
         self._settings.setValue("ollama/gpu_indices", json.dumps(value))
 
+    # Keep model loaded on quit
+    @property
+    def keep_model_loaded(self) -> bool:
+        """If True, model stays in VRAM when the app quits."""
+        val = self._settings.value("model/keep_loaded", False)
+        if isinstance(val, str):
+            return val.lower() == "true"
+        return bool(val)
+
+    @keep_model_loaded.setter
+    def keep_model_loaded(self, value: bool):
+        self._settings.setValue("model/keep_loaded", value)
+
+    # LM Studio URL
+    @property
+    def lmstudio_url(self) -> str:
+        return self._settings.value("ollama/lmstudio_url", "")
+
+    @lmstudio_url.setter
+    def lmstudio_url(self, value: str):
+        self._settings.setValue("ollama/lmstudio_url", value)
+
     # Ollama settings
     @property
     def last_ollama_model(self) -> str:
@@ -158,6 +180,19 @@ class AppSettings:
     def max_cpu_memory_gb(self, value: int):
         self._settings.setValue("model/max_cpu_memory_gb", value)
 
+    @property
+    def nf4_dual_gpu(self) -> bool:
+        """If True, NF4 models split VAE+vision onto secondary GPU to free
+        VRAM on the primary GPU for multi-image I2I."""
+        val = self._settings.value("model/nf4_dual_gpu", False)
+        if isinstance(val, str):
+            return val.lower() == "true"
+        return bool(val)
+
+    @nf4_dual_gpu.setter
+    def nf4_dual_gpu(self, value: bool):
+        self._settings.setValue("model/nf4_dual_gpu", value)
+
     # Global generation mode settings
     @property
     def global_bot_task(self) -> str:
@@ -177,6 +212,16 @@ class AppSettings:
     @global_drop_think.setter
     def global_drop_think(self, value: bool):
         self._settings.setValue("generation/global_drop_think", value)
+
+    # Custom LM Studio system prompt
+    @property
+    def enhance_system_prompt(self) -> str:
+        """Custom system prompt override for LM Studio enhancement. Empty = use default."""
+        return self._settings.value("ollama/system_prompt", "")
+
+    @enhance_system_prompt.setter
+    def enhance_system_prompt(self, value: str):
+        self._settings.setValue("ollama/system_prompt", value)
 
     # UI state
     @property

@@ -24,9 +24,14 @@ def strip_thinking_tags(text: str) -> str:
     Many newer models (Qwen3, DeepSeek R1, etc.) output chain-of-thought
     reasoning wrapped in <think>...</think> or similar tags.
     This function strips those out to get just the final answer.
+
+    For models that wrap the answer in <recaption>...</recaption>, the
+    recaption content is extracted as the final answer.
     """
     if not text:
         return text
+
+    original = text
 
     # Decode unicode escapes (e.g., \u2014 -> —)
     try:
@@ -35,6 +40,16 @@ def strip_thinking_tags(text: str) -> str:
             text = text.encode('utf-8').decode('unicode_escape')
     except (UnicodeDecodeError, UnicodeEncodeError):
         pass  # Keep original if decoding fails
+
+    # First: extract <recaption> content if present (HunyuanImage think models)
+    recaption_match = re.search(
+        r'<recaption>(.*?)</recaption>', text, flags=re.DOTALL | re.IGNORECASE
+    )
+    if recaption_match:
+        logger.info("Extracted <recaption> content from thinking model output")
+        text = recaption_match.group(1).strip()
+        if text:
+            return text
 
     # Remove <think>...</think> blocks (Qwen3, DeepSeek style)
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
@@ -48,23 +63,148 @@ def strip_thinking_tags(text: str) -> str:
     # Remove ```thinking ... ``` blocks
     text = re.sub(r'```thinking.*?```', '', text, flags=re.DOTALL | re.IGNORECASE)
 
+    # Handle unclosed <think> tag (model started thinking but never closed it)
+    # Remove everything from <think> to end of string
+    text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL | re.IGNORECASE)
+
     # Clean up any leftover whitespace
     text = re.sub(r'\n{3,}', '\n\n', text)  # Multiple newlines to double
 
-    return text.strip()
+    result = text.strip()
+
+    # If stripping removed everything, the model output was *only* thinking.
+    # Log it so we can diagnose.
+    if not result and original.strip():
+        logger.warning(
+            f"strip_thinking_tags removed all content. "
+            f"Original ({len(original)} chars): {original[:200]}..."
+        )
+
+    return result
 
 # Default configuration
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+_FALLBACK_LMSTUDIO_URL = "http://localhost:1234"
+
+
+_cached_lmstudio_url = None
+
+
+def _get_lmstudio_url():
+    """Get the LM Studio URL from settings, with auto-discovery fallback."""
+    global _cached_lmstudio_url
+
+    # Try settings first
+    try:
+        from core.settings import get_settings
+        url = get_settings().lmstudio_url
+        if url:
+            # Quick check if it's still reachable
+            try:
+                import requests
+                r = requests.get(f"{url}/v1/models", timeout=2)
+                if r.status_code == 200:
+                    return url
+            except Exception:
+                pass
+            # Saved URL unreachable — fall through to discovery
+    except Exception:
+        pass
+
+    # Try ui.constants default
+    try:
+        from ui.constants import LMSTUDIO_URL
+        try:
+            import requests
+            r = requests.get(f"{LMSTUDIO_URL}/v1/models", timeout=2)
+            if r.status_code == 200:
+                return LMSTUDIO_URL
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Use cached discovery result if available
+    if _cached_lmstudio_url:
+        return _cached_lmstudio_url
+
+    # Auto-discover on the network
+    try:
+        from lmstudio_client import discover_lmstudio
+        found = discover_lmstudio(timeout=0.3)
+        if found:
+            _cached_lmstudio_url = found
+            print(f"[LM STUDIO] Auto-discovered at {found}")
+            # Save for next time
+            try:
+                from core.settings import get_settings
+                get_settings().lmstudio_url = found
+            except Exception:
+                pass
+            return found
+    except Exception:
+        pass
+
+    return _FALLBACK_LMSTUDIO_URL
+
+
+# Keep module-level name for backward compat but make it dynamic
+DEFAULT_LMSTUDIO_URL = _FALLBACK_LMSTUDIO_URL
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
+
+# Backend detection
+BACKEND_OLLAMA = "ollama"
+BACKEND_LMSTUDIO = "lmstudio"
+
+
+def detect_backend() -> tuple:
+    """
+    Auto-detect which LLM backend is available.
+
+    Returns (backend_type, base_url) — checks LM Studio first, then Ollama.
+    """
+    # Check LM Studio first (OpenAI-compatible API)
+    lmstudio_url = _get_lmstudio_url()
+    try:
+        response = requests.get(f"{lmstudio_url}/v1/models", timeout=3)
+        if response.status_code == 200:
+            logger.info("Detected LM Studio backend")
+            return BACKEND_LMSTUDIO, lmstudio_url
+    except Exception:
+        pass
+
+    # Fall back to Ollama
+    try:
+        response = requests.get(f"{DEFAULT_OLLAMA_URL}/api/tags", timeout=3)
+        if response.status_code == 200:
+            logger.info("Detected Ollama backend")
+            return BACKEND_OLLAMA, DEFAULT_OLLAMA_URL
+    except Exception:
+        pass
+
+    logger.warning("No LLM backend detected (tried LM Studio and Ollama)")
+    return None, None
 
 
 def get_loaded_ollama_model() -> Optional[str]:
     """
-    Auto-discover the currently loaded Ollama model.
+    Auto-discover the currently loaded model from any backend.
 
     Returns the model name if one is loaded, None otherwise.
-    Use this to automatically use whatever model the LLM Manager has loaded.
     """
+    # Check LM Studio first
+    lmstudio_url = _get_lmstudio_url()
+    try:
+        response = requests.get(f"{lmstudio_url}/v1/models", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            models = data.get('data', [])
+            if models:
+                return models[0].get('id')
+    except Exception:
+        pass
+
+    # Fall back to Ollama
     try:
         response = requests.get(f"{DEFAULT_OLLAMA_URL}/api/ps", timeout=3)
         if response.status_code == 200:
@@ -77,16 +217,45 @@ def get_loaded_ollama_model() -> Optional[str]:
     return None
 
 
+def get_available_models() -> List[str]:
+    """
+    Get list of available models from whichever backend is running.
+
+    Returns model names/IDs from LM Studio or Ollama.
+    """
+    models = []
+
+    # Check LM Studio
+    lmstudio_url = _get_lmstudio_url()
+    try:
+        response = requests.get(f"{lmstudio_url}/v1/models", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            models.extend(m.get('id', '') for m in data.get('data', []) if m.get('id'))
+    except Exception:
+        pass
+
+    # Check Ollama
+    try:
+        response = requests.get(f"{DEFAULT_OLLAMA_URL}/api/tags", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            models.extend(m['name'] for m in data.get('models', []))
+    except Exception:
+        pass
+
+    return models
+
+
 def get_best_available_model() -> str:
     """
     Get the best available model to use.
 
     Priority:
-    1. Currently loaded model (from LLM Manager)
+    1. Currently loaded model (from LM Studio or Ollama)
     2. Default model if available
     3. Any available model
     """
-    # First check if a model is already loaded
     loaded = get_loaded_ollama_model()
     if loaded:
         logger.info(f"Auto-discovered loaded model: {loaded}")
@@ -326,51 +495,79 @@ def check_model_fits_gpu(model_name: str, gpu_index: int = 0) -> tuple[bool, str
 
 
 class OllamaClient:
-    """Client for interacting with Ollama API"""
+    """Unified client for Ollama and LM Studio (OpenAI-compatible) APIs.
 
-    def __init__(self, base_url: str = DEFAULT_OLLAMA_URL, model: str = DEFAULT_MODEL):
-        self.base_url = base_url.rstrip('/')
+    Auto-detects which backend is available. LM Studio is preferred when both
+    are running since it uses the OpenAI-compatible /v1/ API.
+    """
+
+    def __init__(self, base_url: str = None, model: str = DEFAULT_MODEL):
+        if base_url:
+            # Explicit URL — detect backend type from URL
+            self.base_url = base_url.rstrip('/')
+            if '/v1' in base_url or base_url == _get_lmstudio_url() or base_url == _FALLBACK_LMSTUDIO_URL:
+                self.backend = BACKEND_LMSTUDIO
+            else:
+                self.backend = BACKEND_OLLAMA
+        else:
+            # Auto-detect
+            self.backend, url = detect_backend()
+            self.base_url = (url or DEFAULT_OLLAMA_URL).rstrip('/')
+
         self.model = model
         self._check_connection()
+        logger.info(f"LLM backend: {self.backend or 'none'} at {self.base_url}")
 
     def _check_connection(self) -> bool:
-        """Check if Ollama server is running"""
+        """Check if the LLM server is running."""
         try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            if self.backend == BACKEND_LMSTUDIO:
+                response = requests.get(f"{self.base_url}/v1/models", timeout=5)
+            else:
+                response = requests.get(f"{self.base_url}/api/tags", timeout=5)
             return response.status_code == 200
         except requests.exceptions.ConnectionError:
-            logger.warning("Ollama server not running. Start it with: ollama serve")
+            logger.warning(f"LLM server not running at {self.base_url}")
             return False
 
     def list_models(self) -> List[str]:
-        """List available Ollama models"""
-        try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return [m['name'] for m in data.get('models', [])]
-        except Exception as e:
-            logger.error(f"Error listing models: {e}")
-        return []
+        """List available models from whichever backend is active."""
+        return get_available_models()
 
     def get_loaded_model(self) -> Optional[Dict]:
         """Get the currently loaded model info.
 
         Returns dict with 'name' and 'size_vram' keys, or None if no model loaded.
         """
-        try:
-            response = requests.get(f"{self.base_url}/api/ps", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                models = data.get('models', [])
-                if models:
-                    return {
-                        'name': models[0].get('name', 'unknown'),
-                        'size_vram': models[0].get('size_vram', 0) / (1024**3),  # Convert to GB
-                    }
-        except Exception as e:
-            logger.warning(f"Could not get loaded model: {e}")
-        return None
+        if self.backend == BACKEND_LMSTUDIO:
+            try:
+                response = requests.get(f"{self.base_url}/v1/models", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    models = [m for m in data.get('data', [])
+                              if not m.get('id', '').startswith('text-embedding')]
+                    if models:
+                        return {
+                            'name': models[0].get('id', 'unknown'),
+                            'size_vram': 0,  # LM Studio doesn't report this
+                        }
+            except Exception as e:
+                logger.warning(f"Could not get loaded model: {e}")
+            return None
+        else:
+            try:
+                response = requests.get(f"{self.base_url}/api/ps", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    models = data.get('models', [])
+                    if models:
+                        return {
+                            'name': models[0].get('name', 'unknown'),
+                            'size_vram': models[0].get('size_vram', 0) / (1024**3),
+                        }
+            except Exception as e:
+                logger.warning(f"Could not get loaded model: {e}")
+            return None
 
     def wait_for_model(self, model_name: str, timeout: int = 600, callback=None) -> bool:
         """Wait for a model to be loaded.
@@ -388,18 +585,20 @@ class OllamaClient:
         if callback:
             callback(f"Loading model {model_name}...")
 
-        # First check if model fits in GPU
-        fits, msg = check_model_fits_gpu(model_name)
-        if not fits:
-            logger.warning(msg)
-            if callback:
-                callback(msg)
+        # VRAM check only relevant for Ollama
+        if self.backend == BACKEND_OLLAMA:
+            fits, msg = check_model_fits_gpu(model_name)
+            if not fits:
+                logger.warning(msg)
+                if callback:
+                    callback(msg)
 
         while time.time() - start < timeout:
             loaded = self.get_loaded_model()
             if loaded and model_name in loaded['name']:
                 if callback:
-                    callback(f"Model {model_name} ready ({loaded['size_vram']:.1f}GB VRAM)")
+                    vram_info = f" ({loaded['size_vram']:.1f}GB VRAM)" if loaded['size_vram'] else ""
+                    callback(f"Model {model_name} ready{vram_info}")
                 return True
 
             elapsed = int(time.time() - start)
@@ -419,9 +618,82 @@ class OllamaClient:
         max_tokens: int = 1024,
         stream: bool = False
     ) -> OllamaResponse:
-        """Generate text using Ollama"""
+        """Generate text using the active backend."""
         model = model or self.model
 
+        if self.backend == BACKEND_LMSTUDIO:
+            return self._generate_openai(prompt, system, model, temperature, max_tokens)
+        else:
+            return self._generate_ollama(prompt, system, model, temperature, max_tokens, stream)
+
+    def _generate_openai(
+        self, prompt, system, model, temperature, max_tokens
+    ) -> OllamaResponse:
+        """Generate via OpenAI-compatible API (LM Studio)."""
+        import time
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
+            "stream": False,
+        }
+
+        try:
+            start_time = time.time()
+            response = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=900
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                message = data['choices'][0].get('message', {})
+
+                # Content is the actual answer
+                raw_text = message.get('content') or ''
+
+                # reasoning_content is the thinking — don't use as answer
+                reasoning = (message.get('reasoning_content') or '').strip()
+                if reasoning:
+                    logger.info(
+                        f"Thinking model: reasoning={len(reasoning)} chars, "
+                        f"answer={len(raw_text)} chars"
+                    )
+
+                if not raw_text.strip() and reasoning:
+                    logger.warning(
+                        "Model ran out of tokens during thinking — no answer produced"
+                    )
+
+                clean_text = strip_thinking_tags(raw_text) if raw_text else ''
+
+                usage = data.get('usage', {})
+                duration = time.time() - start_time
+                return OllamaResponse(
+                    text=clean_text,
+                    model=data.get('model', model),
+                    total_duration=duration,
+                    prompt_eval_count=usage.get('prompt_tokens', 0),
+                    eval_count=usage.get('completion_tokens', 0)
+                )
+            else:
+                raise Exception(f"LM Studio error: {response.status_code} - {response.text}")
+
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(f"Cannot connect to LM Studio at {self.base_url}")
+
+    def _generate_ollama(
+        self, prompt, system, model, temperature, max_tokens, stream
+    ) -> OllamaResponse:
+        """Generate via Ollama API."""
         payload = {
             "model": model,
             "prompt": prompt,
@@ -439,18 +711,17 @@ class OllamaClient:
             response = requests.post(
                 f"{self.base_url}/api/generate",
                 json=payload,
-                timeout=900  # 15 min timeout for loading large models
+                timeout=900
             )
 
             if response.status_code == 200:
                 data = response.json()
-                # Strip thinking tags from models that use chain-of-thought
                 raw_text = data.get('response', '')
                 clean_text = strip_thinking_tags(raw_text)
                 return OllamaResponse(
                     text=clean_text,
                     model=data.get('model', model),
-                    total_duration=data.get('total_duration', 0) / 1e9,  # ns to s
+                    total_duration=data.get('total_duration', 0) / 1e9,
                     prompt_eval_count=data.get('prompt_eval_count', 0),
                     eval_count=data.get('eval_count', 0)
                 )
@@ -468,9 +739,53 @@ class OllamaClient:
         temperature: float = 0.7,
         max_tokens: int = 1024
     ) -> Generator[str, None, None]:
-        """Stream generation from Ollama"""
+        """Stream generation from the active backend."""
         model = model or self.model
 
+        if self.backend == BACKEND_LMSTUDIO:
+            yield from self._stream_openai(prompt, system, model, temperature, max_tokens)
+        else:
+            yield from self._stream_ollama(prompt, system, model, temperature, max_tokens)
+
+    def _stream_openai(self, prompt, system, model, temperature, max_tokens):
+        """Stream via OpenAI-compatible API."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        try:
+            with requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                stream=True,
+                timeout=900
+            ) as response:
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith('data: ') and line != 'data: [DONE]':
+                            data = json.loads(line[6:])
+                            delta = data.get('choices', [{}])[0].get('delta', {})
+                            # Try content first, fall back to reasoning_content
+                            content = delta.get('content') or ''
+                            if not content:
+                                content = delta.get('reasoning_content') or ''
+                            if content:
+                                yield content
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(f"Cannot connect to LM Studio at {self.base_url}")
+
+    def _stream_ollama(self, prompt, system, model, temperature, max_tokens):
+        """Stream via Ollama API."""
         payload = {
             "model": model,
             "prompt": prompt,
@@ -489,7 +804,7 @@ class OllamaClient:
                 f"{self.base_url}/api/generate",
                 json=payload,
                 stream=True,
-                timeout=900  # 15 min timeout for loading large models
+                timeout=900
             ) as response:
                 for line in response.iter_lines():
                     if line:
@@ -503,9 +818,11 @@ class OllamaClient:
 
 
 class PromptEnhancer:
-    """Enhance and generate image prompts using Ollama"""
+    """Enhance and generate image prompts using Ollama or LM Studio"""
 
-    def __init__(self, ollama_url: str = DEFAULT_OLLAMA_URL, model: str = DEFAULT_MODEL):
+    def __init__(self, ollama_url: str = None, model: str = None):
+        if model is None:
+            model = get_best_available_model()
         self.client = OllamaClient(ollama_url, model)
 
     def enhance(
@@ -537,21 +854,29 @@ class PromptEnhancer:
         if style:
             user_prompt = f"[Style: {style}] {prompt}"
 
-        # Use dynamic system prompt based on length/complexity settings
-        system_prompt = get_enhance_system_prompt(length, complexity)
+        # Use custom system prompt from settings if set, otherwise auto-generate
+        system_prompt = None
+        try:
+            from core.settings import get_settings
+            custom = get_settings().enhance_system_prompt
+            if custom:
+                system_prompt = custom
+        except Exception:
+            pass
+        if not system_prompt:
+            system_prompt = get_enhance_system_prompt(length, complexity)
 
-        # Adjust max tokens based on length setting
-        # Higher values to account for thinking models that may output reasoning
+        # Thinking models need a large token budget (reasoning + answer).
         max_tokens_map = {
-            "minimal": 512,
-            "short": 768,
-            "medium": 1024,
-            "long": 1536,
-            "detailed": 2048,
-            "cinematic": 4096,
-            "experimental": 6000,
+            "minimal": 4096,
+            "short": 6000,
+            "medium": 8192,
+            "long": 10000,
+            "detailed": 12000,
+            "cinematic": 16000,
+            "experimental": 16000,
         }
-        max_tokens = max_tokens_map.get(length, 1024)
+        max_tokens = max_tokens_map.get(length, 8192)
 
         # If max_length is set, also limit max_tokens proportionally
         # Rough estimate: 1 token ≈ 4 characters

@@ -3,6 +3,7 @@ Qt Signal-emitting wrapper around the existing AppState singleton.
 Bridges the threading.Lock-based backend state with PySide6 signal/slot UI updates.
 """
 
+import threading
 from PySide6.QtCore import QObject, Signal, QTimer
 
 
@@ -202,16 +203,20 @@ class DesktopState(QObject):
             print(f"[INIT] Style presets load error: {e}")
 
     def _update_vram(self):
-        """Periodic VRAM usage update."""
-        try:
-            import torch
-            if torch.cuda.is_available():
-                gpu_idx = self.state.selected_gpu
-                used = torch.cuda.memory_allocated(gpu_idx) / (1024**3)
-                total = torch.cuda.get_device_properties(gpu_idx).total_memory / (1024**3)
-                self.vram_updated.emit(gpu_idx, used, total)
-        except Exception:
-            pass
+        """Periodic VRAM usage update. Runs CUDA queries off the main thread
+        to avoid blocking the Qt event loop (which can crash during repaints)."""
+        def _query():
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_idx = self.state.selected_gpu
+                    used = torch.cuda.memory_allocated(gpu_idx) / (1024**3)
+                    total = torch.cuda.get_device_properties(gpu_idx).total_memory / (1024**3)
+                    # Signal emission is thread-safe in Qt (auto-queued across threads)
+                    self.vram_updated.emit(gpu_idx, used, total)
+            except Exception:
+                pass
+        threading.Thread(target=_query, daemon=True).start()
 
     def get_gpu_list(self) -> list:
         """Get the list of detected GPUs."""

@@ -40,6 +40,7 @@ class DatasetPrepPanel(QWidget):
         self._pass_widgets = {}  # {pass_name: (checkbox, text_edit)}
         self._setup_ui()
         self._connect_signals()
+        self._populate_quality()    # Populate with default presets
         self._refresh_config_list()
 
     def _setup_ui(self):
@@ -159,6 +160,14 @@ class DatasetPrepPanel(QWidget):
         ipp_row.addStretch()
         settings_layout.addLayout(ipp_row)
 
+        # Quality / Steps
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(QLabel("Quality:"))
+        self.quality_combo = QComboBox()
+        self.quality_combo.setMinimumWidth(180)
+        quality_row.addWidget(self.quality_combo, stretch=1)
+        settings_layout.addLayout(quality_row)
+
         guidance_row = QHBoxLayout()
         guidance_row.addWidget(QLabel("Guidance:"))
         self.guidance_slider = QSlider(Qt.Orientation.Horizontal)
@@ -178,6 +187,29 @@ class DatasetPrepPanel(QWidget):
 
         settings_group.setLayout(settings_layout)
         config_layout.addWidget(settings_group)
+
+        # ── Prompt enhancement ──
+        from ui.constants import OLLAMA_LENGTH_OPTIONS, OLLAMA_COMPLEXITY_OPTIONS
+        enh_group = QGroupBox("Prompt Enhancement")
+        enh_layout = QVBoxLayout()
+        self.enhance_check = QCheckBox("Enhance with LM Studio / Ollama")
+        enh_layout.addWidget(self.enhance_check)
+        enh_row = QHBoxLayout()
+        enh_row.addWidget(QLabel("Length:"))
+        self.ollama_length = QComboBox()
+        for opt in OLLAMA_LENGTH_OPTIONS:
+            self.ollama_length.addItem(opt)
+        self.ollama_length.setCurrentText("medium")
+        enh_row.addWidget(self.ollama_length)
+        enh_row.addWidget(QLabel("Complexity:"))
+        self.ollama_complexity = QComboBox()
+        for opt in OLLAMA_COMPLEXITY_OPTIONS:
+            self.ollama_complexity.addItem(opt)
+        self.ollama_complexity.setCurrentText("detailed")
+        enh_row.addWidget(self.ollama_complexity)
+        enh_layout.addLayout(enh_row)
+        enh_group.setLayout(enh_layout)
+        config_layout.addWidget(enh_group)
 
         # ── Config management ──
         config_mgmt_row = QHBoxLayout()
@@ -269,6 +301,39 @@ class DatasetPrepPanel(QWidget):
         self.save_config_btn.clicked.connect(self._on_save_config)
         self.load_config_btn.clicked.connect(self._on_load_config)
         self.input_folder.textChanged.connect(self._on_input_changed)
+
+        # Update quality/guidance when model loads
+        self.state.model_loaded.connect(self._on_model_loaded)
+        self.state.model_unloaded.connect(self._on_model_unloaded)
+
+    def _populate_quality(self, model_type=None):
+        """Populate quality dropdown with model-appropriate presets."""
+        from ui.constants import get_quality_presets
+        presets = get_quality_presets(model_type)
+        self.quality_combo.clear()
+        for name, info in presets.items():
+            self.quality_combo.addItem(f"{name} ({info['steps']} steps)", name)
+        if self.quality_combo.count() > 1:
+            self.quality_combo.setCurrentIndex(1)
+
+    @Slot(str, str)
+    def _on_model_loaded(self, model_type: str, msg: str):
+        """Update quality presets and guidance when model loads."""
+        self._populate_quality(model_type)
+        from ui.constants import MODEL_DEFAULT_QUALITY, get_default_guidance
+        default_quality = MODEL_DEFAULT_QUALITY.get(model_type, "Standard")
+        for i in range(self.quality_combo.count()):
+            if self.quality_combo.itemData(i) == default_quality or default_quality in self.quality_combo.itemText(i):
+                self.quality_combo.setCurrentIndex(i)
+                break
+        default_guidance = get_default_guidance(model_type)
+        self.guidance_slider.setValue(int(default_guidance * 10))
+
+    @Slot()
+    def _on_model_unloaded(self):
+        """Reset to default presets."""
+        self._populate_quality()
+        self.guidance_slider.setValue(50)
 
     # ── Folder browsing ──
 
@@ -364,15 +429,23 @@ class DatasetPrepPanel(QWidget):
         from ui.state import get_state
         state = get_state()
 
+        # Get quality preset name
+        quality_data = self.quality_combo.currentData()
+        quality = quality_data if quality_data else self.quality_combo.currentText().split(" (")[0]
+
         return DatasetPrepConfig(
             input_folder=self.input_folder.text().strip(),
             output_folder=self.output_folder.text().strip(),
             enabled_passes=self._get_enabled_passes(),
             images_per_pass=self.images_per_pass.value(),
+            quality=quality,
             guidance_scale=self.guidance_slider.value() / 10.0,
             random_seeds=self.random_seeds_check.isChecked(),
             bot_task=state.global_bot_task,
             drop_think=state.global_drop_think,
+            enhance=self.enhance_check.isChecked(),
+            ollama_length=self.ollama_length.currentText(),
+            ollama_complexity=self.ollama_complexity.currentText(),
         )
 
     # ── Actions ──
@@ -538,6 +611,12 @@ class DatasetPrepPanel(QWidget):
         self.output_folder.setText(config.output_folder)
         self.images_per_pass.setValue(config.images_per_pass)
         self.guidance_slider.setValue(int(config.guidance_scale * 10))
+
+        # Restore quality preset
+        for i in range(self.quality_combo.count()):
+            if self.quality_combo.itemData(i) == config.quality or config.quality in self.quality_combo.itemText(i):
+                self.quality_combo.setCurrentIndex(i)
+                break
         self.random_seeds_check.setChecked(config.random_seeds)
 
         # Update global state

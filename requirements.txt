@@ -1,0 +1,26 @@
+# Automatic1112 — Python Dependencies
+# Install PyTorch with CUDA first (see README.md), then:
+#   pip install -r requirements.txt
+
+# Core ML
+transformers==4.57.3
+accelerate
+diffusers>=0.32.0
+safetensors==0.4.5
+tokenizers>=0.21.0
+huggingface_hub[cli]
+sdnq>=0.1.4
+einops>=0.8.0
+
+# Image processing
+pillow==11.3.0
+numpy==1.26.4
+
+# Desktop UI
+PySide6
+
+# System monitoring
+psutil
+
+# Networking (prompt enhancement)
+requests

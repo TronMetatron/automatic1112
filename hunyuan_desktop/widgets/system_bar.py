@@ -3,7 +3,8 @@
 from PySide6.QtWidgets import (
     QToolBar, QLabel, QComboBox, QPushButton, QProgressBar, QWidget, QHBoxLayout, QMessageBox, QMenu, QWidgetAction, QCheckBox, QVBoxLayout, QSpinBox
 )
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QFont
+from PySide6.QtCore import Qt, QThread, Slot
 
 from core.model_worker import ModelLoadWorker, ModelUnloadWorker
 from core.settings import get_settings
@@ -29,13 +30,11 @@ class SystemBar(QToolBar):
         self._populate_gpus()
 
     def _setup_ui(self):
-        # Model selector
+        # Model selector — grouped by quantization class with colored rows
         self.addWidget(QLabel("Model:"))
         self.model_selector = QComboBox()
-        self.model_selector.addItem("Base - Create Mode (T2I, 20 steps)", "base")
-        self.model_selector.addItem("Instruct - Quality Mode (T2I+I2I, 50 steps)", "instruct")
-        self.model_selector.addItem("Distil - Edit Mode (T2I+I2I, 8 steps)", "distil")
-        self.model_selector.setMinimumWidth(300)
+        self._populate_model_selector()
+        self.model_selector.setMinimumWidth(340)
         self.addWidget(self.model_selector)
 
         self.addSeparator()
@@ -141,6 +140,70 @@ class SystemBar(QToolBar):
         self.ollama_label.setMinimumWidth(150)
         self.addWidget(self.ollama_label)
 
+    def _populate_model_selector(self):
+        """Build the model dropdown with grouped sections and row colors.
+
+        Groups:
+          • Full Quality (SDNQ) — green tint
+          • 4-bit NF4 (single-GPU friendly) — amber tint
+          • Other Pipelines — blue tint
+        """
+        model = QStandardItemModel(self.model_selector)
+
+        # color palette: (fg, bg) per group
+        green_fg = QColor("#a5d6a7")
+        amber_fg = QColor("#ffcc80")
+        blue_fg = QColor("#90caf9")
+        header_fg = QColor("#9e9e9e")
+
+        def _header(text):
+            item = QStandardItem(text)
+            item.setFlags(Qt.ItemFlag.NoItemFlags)  # not selectable
+            font = QFont()
+            font.setBold(True)
+            font.setPointSize(font.pointSize() - 1)
+            item.setFont(font)
+            item.setForeground(QBrush(header_fg))
+            return item
+
+        def _entry(text, data, fg):
+            item = QStandardItem(text)
+            item.setData(data, Qt.ItemDataRole.UserRole)
+            item.setForeground(QBrush(fg))
+            return item
+
+        # ── Full Quality (SDNQ) ──
+        model.appendRow(_header("── Full Quality (SDNQ) ──"))
+        model.appendRow(_entry(
+            "● Base — Create Mode (T2I, 20 steps)", "base", green_fg))
+        model.appendRow(_entry(
+            "● Instruct — Quality Mode (T2I+I2I, 50 steps)", "instruct", green_fg))
+        model.appendRow(_entry(
+            "● Distil — Edit Mode (T2I+I2I, 8 steps)", "distil", green_fg))
+
+        # ── 4-bit NF4 ──
+        model.appendRow(_header("── 4-bit NF4 (~48GB single GPU) ──"))
+        model.appendRow(_entry(
+            "◆ Instruct NF4 — 4-bit Quality (T2I+I2I, 50 steps)",
+            "nf4", amber_fg))
+        model.appendRow(_entry(
+            "◆ Distil NF4 — 4-bit Fast (T2I+I2I, 8 steps)",
+            "distil_nf4", amber_fg))
+
+        # ── Other Pipelines ──
+        model.appendRow(_header("── Other Pipelines ──"))
+        model.appendRow(_entry(
+            "▲ FireRed 1.1 — Image Edit (T2I+I2I, 40 steps)",
+            "firered", blue_fg))
+
+        self.model_selector.setModel(model)
+
+        # Skip the first header row when auto-selecting
+        for i in range(model.rowCount()):
+            if model.item(i).flags() & Qt.ItemFlag.ItemIsSelectable:
+                self.model_selector.setCurrentIndex(i)
+                break
+
     def _connect_signals(self):
         self.load_btn.clicked.connect(self._on_load)
         self.unload_btn.clicked.connect(self._on_unload)
@@ -204,6 +267,17 @@ class SystemBar(QToolBar):
         cpu_row.addWidget(self.cpu_mem_spin)
         layout.addLayout(cpu_row)
 
+        # NF4 dual-GPU split
+        self.nf4_dual_check = QCheckBox("NF4 dual-GPU split (VAE/vision → 2nd GPU)")
+        self.nf4_dual_check.setToolTip(
+            "For NF4 models: offload VAE + vision encoder to the secondary GPU\n"
+            "to free VRAM on the primary GPU for multi-image I2I conditioning.\n"
+            "Requires reload to take effect."
+        )
+        self.nf4_dual_check.setChecked(settings.nf4_dual_gpu)
+        self.nf4_dual_check.stateChanged.connect(self._on_nf4_dual_changed)
+        layout.addWidget(self.nf4_dual_check)
+
         # Apply button
         apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(self._on_apply_offload_settings)
@@ -238,6 +312,15 @@ class SystemBar(QToolBar):
         app_state.max_cpu_memory_gb = cpu_mem
 
         self.status_label.setText(f"Offload: GPU≤{gpu_mem}GB, RAM≤{cpu_mem}GB")
+
+    @Slot(int)
+    def _on_nf4_dual_changed(self, state: int):
+        """Persist NF4 dual-GPU split toggle."""
+        enabled = state == Qt.CheckState.Checked.value
+        get_settings().nf4_dual_gpu = enabled
+        self.status_label.setText(
+            "NF4 dual-GPU ON (reload model)" if enabled else "NF4 dual-GPU OFF"
+        )
 
     @Slot(int)
     def _on_offload_changed(self, state: int):
@@ -403,7 +486,7 @@ class SystemBar(QToolBar):
         self._load_worker = ModelLoadWorker(model_type)
         self._load_worker.progress.connect(self._on_load_progress)
         self._load_worker.finished.connect(self._on_load_finished)
-        self._load_worker.start()
+        self._load_worker.start(QThread.LowPriority)
 
     @Slot()
     def _on_unload(self):

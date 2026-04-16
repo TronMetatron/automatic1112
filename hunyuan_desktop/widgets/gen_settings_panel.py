@@ -142,15 +142,24 @@ class GenSettingsPanel(QWidget):
         self.i2i_group.setChecked(False)
         i2i_layout = QVBoxLayout()
 
-        self.image_drop = ImageDropZone()
-        i2i_layout.addWidget(self.image_drop)
+        # Reference image slots (up to 3 for FireRed)
+        self.image_drops = []
+        for i in range(3):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"Img {i+1}:"))
+            drop = ImageDropZone()
+            drop.setMinimumHeight(80)
+            drop.setMaximumHeight(120)
+            row.addWidget(drop)
+            clear_btn = QPushButton("X")
+            clear_btn.setMaximumWidth(30)
+            clear_btn.clicked.connect(drop.clear_image)
+            row.addWidget(clear_btn)
+            i2i_layout.addLayout(row)
+            self.image_drops.append(drop)
 
-        # Clear button
-        clear_row = QHBoxLayout()
-        self.clear_image_btn = QPushButton("Clear Image")
-        clear_row.addWidget(self.clear_image_btn)
-        clear_row.addStretch()
-        i2i_layout.addLayout(clear_row)
+        # Backward-compat alias
+        self.image_drop = self.image_drops[0]
 
         # Guidance scale
         guidance_row = QHBoxLayout()
@@ -203,7 +212,6 @@ class GenSettingsPanel(QWidget):
     def _connect_signals(self):
         self.random_seed_btn.clicked.connect(self._randomize_seed)
         self.guidance_slider.valueChanged.connect(self._on_guidance_changed)
-        self.clear_image_btn.clicked.connect(self.image_drop.clear_image)
 
         # Show/hide I2I based on model type
         self.state.model_loaded.connect(self._on_model_loaded)
@@ -243,7 +251,7 @@ class GenSettingsPanel(QWidget):
         supports_i2i = info.get("supports_img2img", False)
         self.i2i_group.setVisible(supports_i2i)
         # Think mode is available for instruct/distil models
-        is_instruct = model_type in ("instruct", "distil", "instruct_int8", "distil_int8")
+        is_instruct = model_type in ("instruct", "distil", "nf4", "distil_nf4", "instruct_int8", "distil_int8")
         self.think_group.setVisible(is_instruct)
 
         # Rebuild dropdowns with model-appropriate presets
@@ -287,9 +295,16 @@ class GenSettingsPanel(QWidget):
         return self.guidance_slider.value() / 10.0
 
     def get_i2i_image_path(self) -> str:
+        """Legacy: return first image path."""
         if self.i2i_group.isChecked():
-            return self.image_drop.get_image_path()
+            return self.image_drops[0].get_image_path()
         return ""
+
+    def get_i2i_image_paths(self) -> list:
+        """Return all set reference image paths."""
+        if not self.i2i_group.isChecked():
+            return []
+        return [d.get_image_path() for d in self.image_drops if d.get_image_path()]
 
     def get_bot_task(self) -> str:
         """Get the bot_task model value (e.g. 'image', 'think')."""
@@ -338,6 +353,7 @@ class GenSettingsPanel(QWidget):
             "batch_count": self.get_batch_count(),
             "guidance_scale": self.get_guidance_scale(),
             "i2i_image_path": self.get_i2i_image_path(),
+            "i2i_image_paths": self.get_i2i_image_paths(),
             "bot_task": self.get_bot_task(),
             "drop_think": self.get_drop_think(),
         }
@@ -354,11 +370,16 @@ class GenSettingsPanel(QWidget):
             self.set_batch_count(data["batch_count"])
         if "guidance_scale" in data:
             self.guidance_slider.setValue(int(data["guidance_scale"] * 10))
-        if "i2i_image_path" in data and data["i2i_image_path"]:
-            # Only set if path exists
+        if "i2i_image_paths" in data and data["i2i_image_paths"]:
+            from pathlib import Path
+            for i, p in enumerate(data["i2i_image_paths"][:3]):
+                if p and Path(p).exists():
+                    self.image_drops[i].set_image(p)
+            self.i2i_group.setChecked(True)
+        elif "i2i_image_path" in data and data["i2i_image_path"]:
             from pathlib import Path
             if Path(data["i2i_image_path"]).exists():
-                self.image_drop.set_image(data["i2i_image_path"])
+                self.image_drops[0].set_image(data["i2i_image_path"])
                 self.i2i_group.setChecked(True)
         if "bot_task" in data:
             self.set_bot_task(data["bot_task"])

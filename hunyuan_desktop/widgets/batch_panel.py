@@ -133,7 +133,7 @@ class BatchPanel(QWidget):
         enhance_group = QGroupBox("Prompt Enhancement")
         enhance_layout = QVBoxLayout()
 
-        self.enhance_check = QCheckBox("Enhance with Ollama")
+        self.enhance_check = QCheckBox("Enhance with LM Studio")
         enhance_layout.addWidget(self.enhance_check)
 
         enh_row1 = QHBoxLayout()
@@ -198,7 +198,7 @@ class BatchPanel(QWidget):
         preview_btn_row.addWidget(self.preview_wildcards_btn)
 
         self.preview_enhanced_btn = QPushButton("Preview Enhanced")
-        self.preview_enhanced_btn.setToolTip("Resolve wildcards AND run Ollama enhancement")
+        self.preview_enhanced_btn.setToolTip("Resolve wildcards AND run LM Studio enhancement")
         self.preview_enhanced_btn.clicked.connect(self._on_preview_enhanced)
         preview_btn_row.addWidget(self.preview_enhanced_btn)
 
@@ -348,17 +348,20 @@ class BatchPanel(QWidget):
         self.ollama_complexity.addItems(OLLAMA_COMPLEXITY_OPTIONS)
         self.ollama_complexity.setCurrentText("detailed")
 
-        # Ollama models
+        # LM Studio models
         self.ollama_model.clear()
         try:
-            if self.state.state.ollama_available and self.state.state.ollama_manager:
-                models = self.state.state.ollama_manager.list_models()
+            from lmstudio_client import LMStudioClient
+            from ui.constants import get_lmstudio_url
+            client = LMStudioClient(base_url=get_lmstudio_url())
+            if client.is_available():
+                models = client.list_models()
                 for m in models:
-                    self.ollama_model.addItem(m.get("name", str(m)))
+                    self.ollama_model.addItem(m)
         except Exception:
             pass
         if self.ollama_model.count() == 0:
-            self.ollama_model.addItem("qwen2.5:7b-instruct")
+            self.ollama_model.addItem("lmstudio")
 
         self._toggle_enhance(False)
 
@@ -526,7 +529,7 @@ class BatchPanel(QWidget):
     @Slot(str, str)
     def _on_model_loaded(self, model_type, msg):
         """Show/hide think mode based on model type and set appropriate quality."""
-        is_instruct = model_type in ("instruct", "distil", "instruct_int8", "distil_int8")
+        is_instruct = model_type in ("instruct", "distil", "nf4", "distil_nf4", "instruct_int8", "distil_int8")
         self.think_group.setVisible(is_instruct)
         self.cot_group.setVisible(is_instruct)
 
@@ -623,28 +626,46 @@ class BatchPanel(QWidget):
             resolved = self._resolve_wildcards(full, generation_index=idx)
             resolved_themes.append((theme, resolved))
 
-        # Show wildcard results immediately and start enhancing first theme
+        # Show wildcard results immediately and start enhancing all themes
         lines = []
         for idx, (orig, resolved) in enumerate(resolved_themes):
             lines.append(f"--- Theme {idx+1} ---")
             lines.append(f"Resolved: {resolved}")
             lines.append("")
-        lines.append("--- Enhancing theme 1 with Ollama... ---")
+        lines.append(f"--- Enhancing {len(resolved_themes)} theme(s) with LM Studio... ---")
         self.preview_display.setText("\n".join(lines))
-        self.preview_prompt_status.setText("Enhancing...")
+        self.preview_prompt_status.setText(f"Enhancing 1/{len(resolved_themes)}...")
         self.preview_enhanced_btn.setEnabled(False)
 
-        # Store for callback
+        # Store for sequential enhancement
         self._preview_resolved_themes = resolved_themes
+        self._preview_enhanced_results = []  # list of (original, enhanced_or_None)
+        self._preview_enhance_index = 0
+        self._preview_model = self.ollama_model.currentText()
+        self._preview_length = self.ollama_length.currentText()
+        self._preview_complexity = self.ollama_complexity.currentText()
 
-        # Enhance the first resolved theme
-        model = self.ollama_model.currentText()
-        length = self.ollama_length.currentText()
-        complexity = self.ollama_complexity.currentText()
+        # Start enhancing the first theme
+        self._enhance_next_preview_theme()
+
+    def _enhance_next_preview_theme(self):
+        """Enhance the next theme in the queue."""
+        idx = self._preview_enhance_index
+        themes = self._preview_resolved_themes
+
+        if idx >= len(themes):
+            # All done — show results
+            self._show_all_preview_results()
+            return
+
+        self.preview_prompt_status.setText(
+            f"Enhancing {idx+1}/{len(themes)}..."
+        )
 
         from core.ollama_worker import OllamaEnhanceWorker
         self._preview_worker = OllamaEnhanceWorker(
-            resolved_themes[0][1], model, length, complexity
+            themes[idx][1], self._preview_model,
+            self._preview_length, self._preview_complexity
         )
         self._preview_worker.completed.connect(self._on_batch_preview_enhance_done)
         self._preview_worker.failed.connect(self._on_batch_preview_enhance_failed)
@@ -652,32 +673,43 @@ class BatchPanel(QWidget):
 
     @Slot(str, str)
     def _on_batch_preview_enhance_done(self, original, enhanced):
-        """Handle batch preview enhancement completion."""
-        lines = []
-        lines.append("--- Theme 1 Enhanced (Ollama) ---")
-        lines.append(enhanced)
-        lines.append("")
-        for idx, (orig, resolved) in enumerate(self._preview_resolved_themes):
-            lines.append(f"--- Theme {idx+1} Wildcards Resolved ---")
-            if orig != resolved:
-                lines.append(f"Original: {orig}")
-            lines.append(f"Resolved: {resolved}")
-            lines.append("")
-        self.preview_display.setText("\n".join(lines))
-        self.preview_enhanced_btn.setEnabled(True)
-        self.preview_prompt_status.setText("Preview complete")
+        """Handle one theme's enhancement completion, then start the next."""
+        self._preview_enhanced_results.append((original, enhanced))
+        self._preview_enhance_index += 1
+        self._enhance_next_preview_theme()
 
     @Slot(str)
     def _on_batch_preview_enhance_failed(self, error):
-        """Handle batch preview enhancement failure."""
-        lines = [f"--- Enhancement Failed: {error} ---", ""]
-        for idx, (orig, resolved) in enumerate(self._preview_resolved_themes):
-            lines.append(f"--- Theme {idx+1} Wildcards Resolved ---")
-            lines.append(f"Resolved: {resolved}")
+        """Handle one theme's enhancement failure, continue with the rest."""
+        idx = self._preview_enhance_index
+        orig = self._preview_resolved_themes[idx][1]
+        self._preview_enhanced_results.append((orig, f"[FAILED: {error}]"))
+        self._preview_enhance_index += 1
+        self._enhance_next_preview_theme()
+
+    def _show_all_preview_results(self):
+        """Display all enhanced themes in the preview."""
+        lines = []
+        for idx, ((orig_theme, resolved), (_, enhanced)) in enumerate(
+            zip(self._preview_resolved_themes, self._preview_enhanced_results)
+        ):
+            lines.append(f"=== Theme {idx+1} ===")
+            if orig_theme != resolved:
+                lines.append(f"Original:  {orig_theme}")
+                lines.append(f"Wildcards: {resolved}")
+            else:
+                lines.append(f"Input: {resolved}")
+            lines.append(f"Enhanced:  {enhanced}")
             lines.append("")
+
         self.preview_display.setText("\n".join(lines))
         self.preview_enhanced_btn.setEnabled(True)
-        self.preview_prompt_status.setText(f"Enhancement failed: {error[:40]}")
+        total = len(self._preview_enhanced_results)
+        failed = sum(1 for _, e in self._preview_enhanced_results if e.startswith("[FAILED"))
+        if failed:
+            self.preview_prompt_status.setText(f"Done: {total - failed}/{total} enhanced, {failed} failed")
+        else:
+            self.preview_prompt_status.setText(f"All {total} themes enhanced")
 
     @Slot()
     def _on_save_config(self):

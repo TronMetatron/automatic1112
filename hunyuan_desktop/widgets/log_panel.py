@@ -58,6 +58,7 @@ class LogPanel(QWidget):
         controls.addWidget(QLabel("Show:"))
         self.filter_combo = QComboBox()
         self.filter_combo.addItem("All", "all")
+        self.filter_combo.addItem("Prompt Pipeline", "prompt")
         self.filter_combo.addItem("Stdout Only", "stdout")
         self.filter_combo.addItem("Stderr Only", "stderr")
         self.filter_combo.currentIndexChanged.connect(self._apply_filter)
@@ -145,7 +146,16 @@ class LogPanel(QWidget):
 
         # Apply current filter
         current_filter = self.filter_combo.currentData()
-        if current_filter == 'all' or current_filter == stream_type:
+        show = False
+        if current_filter == 'all':
+            show = True
+        elif current_filter == 'prompt':
+            # Show only prompt pipeline tags
+            show = any(tag in text for tag in ('[ORIGINAL]', '[WILDCARD]', '[LLM]', '[FINAL PROMPT]'))
+        elif current_filter == stream_type:
+            show = True
+
+        if show:
             search_text = self.search_input.text().lower()
             if not search_text or search_text in text.lower():
                 self._append_text(text, stream_type)
@@ -157,12 +167,21 @@ class LogPanel(QWidget):
         cursor = self.log_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
-        # Set color based on stream type
+        # Set color based on stream type and content tags
         fmt = QTextCharFormat()
         if stream_type == 'stderr':
             fmt.setForeground(QColor("#ff6b6b"))  # Red for errors
         elif '[ERROR]' in text or 'Error' in text or 'error' in text:
             fmt.setForeground(QColor("#ff9f43"))  # Orange for error mentions
+        elif '[FINAL PROMPT]' in text:
+            fmt.setForeground(QColor("#00e676"))  # Bright green — what the AI renderer sees
+            fmt.setFontWeight(700)
+        elif '[WILDCARD]' in text:
+            fmt.setForeground(QColor("#ff6ac1"))  # Hot pink — wildcard resolution
+        elif '[LLM]' in text or '[LLM ENHANCE]' in text or '[BATCH ENHANCE]' in text:
+            fmt.setForeground(QColor("#42a5f5"))  # Bright blue — LLM enhancement
+        elif '[ORIGINAL]' in text:
+            fmt.setForeground(QColor("#b0b0b0"))  # Dim gray — original input
         elif '[WARN]' in text or 'Warning' in text:
             fmt.setForeground(QColor("#feca57"))  # Yellow for warnings
         elif '[INFO]' in text:
@@ -171,6 +190,8 @@ class LogPanel(QWidget):
             fmt.setForeground(QColor("#5f27cd"))  # Purple for init
         elif '[GPU]' in text:
             fmt.setForeground(QColor("#00d2d3"))  # Cyan for GPU
+        elif '[GEN]' in text or '[BATCH]' in text:
+            fmt.setForeground(QColor("#aaaaaa"))  # Light gray for gen/batch status
         else:
             fmt.setForeground(QColor("#d4d4d4"))  # Default gray
 
@@ -202,8 +223,16 @@ class LogPanel(QWidget):
         current_filter = self.filter_combo.currentData()
         search_text = self.search_input.text().lower()
 
+        prompt_tags = ('[ORIGINAL]', '[WILDCARD]', '[LLM]', '[FINAL PROMPT]')
         for text, stream_type in self._all_logs:
-            if current_filter == 'all' or current_filter == stream_type:
+            show = False
+            if current_filter == 'all':
+                show = True
+            elif current_filter == 'prompt':
+                show = any(tag in text for tag in prompt_tags)
+            elif current_filter == stream_type:
+                show = True
+            if show:
                 if not search_text or search_text in text.lower():
                     self._append_text(text, stream_type)
 

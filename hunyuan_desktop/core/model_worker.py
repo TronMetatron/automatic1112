@@ -1,5 +1,6 @@
 """QThread worker for model loading/unloading operations."""
 
+import os
 from PySide6.QtCore import QThread, Signal
 
 
@@ -14,6 +15,13 @@ class ModelLoadWorker(QThread):
         self.model_type = model_type
 
     def run(self):
+        # Lower OS scheduling priority so the UI thread stays responsive
+        # during the memory-intensive model load (nice +10)
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+
         try:
             from core.model_manager import load_model, set_model_type
 

@@ -179,6 +179,20 @@ class MainWindow(QMainWindow):
             lambda: self.edit_image2_drop.clear_image()
         )
 
+        # Reference Image 3 (optional - for FireRed)
+        img3_row = QHBoxLayout()
+        img3_row.addWidget(QLabel("Reference Image 3 (optional):"))
+        self.edit_clear_img3_btn = QPushButton("Clear")
+        self.edit_clear_img3_btn.setMaximumWidth(50)
+        img3_row.addWidget(self.edit_clear_img3_btn)
+        left_layout.addLayout(img3_row)
+        self.edit_image3_drop = ImageDropZone()
+        self.edit_image3_drop.setMinimumHeight(120)
+        left_layout.addWidget(self.edit_image3_drop)
+        self.edit_clear_img3_btn.clicked.connect(
+            lambda: self.edit_image3_drop.clear_image()
+        )
+
         # Edit instruction
         left_layout.addWidget(QLabel("Edit Instruction:"))
         self.edit_prompt = PromptEditor(
@@ -235,6 +249,29 @@ class MainWindow(QMainWindow):
         seed_layout.addWidget(self.edit_seed)
         seed_layout.addStretch()
         left_layout.addLayout(seed_layout)
+
+        # Prompt enhancement group
+        from ui.constants import OLLAMA_LENGTH_OPTIONS, OLLAMA_COMPLEXITY_OPTIONS
+        enhance_group = QGroupBox("Prompt Enhancement")
+        enhance_layout = QVBoxLayout()
+        self.edit_enhance_check = QCheckBox("Enhance with LM Studio / Ollama")
+        enhance_layout.addWidget(self.edit_enhance_check)
+        enh_row = QHBoxLayout()
+        enh_row.addWidget(QLabel("Length:"))
+        self.edit_ollama_length = QComboBox()
+        for opt in OLLAMA_LENGTH_OPTIONS:
+            self.edit_ollama_length.addItem(opt)
+        self.edit_ollama_length.setCurrentText("medium")
+        enh_row.addWidget(self.edit_ollama_length)
+        enh_row.addWidget(QLabel("Complexity:"))
+        self.edit_ollama_complexity = QComboBox()
+        for opt in OLLAMA_COMPLEXITY_OPTIONS:
+            self.edit_ollama_complexity.addItem(opt)
+        self.edit_ollama_complexity.setCurrentText("detailed")
+        enh_row.addWidget(self.edit_ollama_complexity)
+        enhance_layout.addLayout(enh_row)
+        enhance_group.setLayout(enhance_layout)
+        left_layout.addWidget(enhance_group)
 
         # Edit button
         self.edit_generate_btn = QPushButton("EDIT IMAGE")
@@ -465,6 +502,14 @@ class MainWindow(QMainWindow):
 
         tools_menu.addSeparator()
 
+        lmstudio_settings_action = QAction("&LM Studio Settings...", self)
+        lmstudio_settings_action.triggered.connect(
+            lambda: self.prompt_panel._on_edit_system_prompt()
+        )
+        tools_menu.addAction(lmstudio_settings_action)
+
+        tools_menu.addSeparator()
+
         open_output_action = QAction("Open Output &Directory", self)
         open_output_action.triggered.connect(self._open_output_dir)
         tools_menu.addAction(open_output_action)
@@ -589,7 +634,7 @@ class MainWindow(QMainWindow):
             ollama_length=self.prompt_panel.get_ollama_settings()["length"],
             ollama_complexity=self.prompt_panel.get_ollama_settings()["complexity"],
             guidance_scale=self.gen_settings.get_guidance_scale(),
-            input_image_path=self.gen_settings.get_i2i_image_path(),
+            input_image_paths=self.gen_settings.get_i2i_image_paths(),
             bot_task=self.system_bar.get_global_bot_task(),
             drop_think=self.system_bar.get_global_drop_think(),
         )
@@ -659,14 +704,12 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Generation already in progress")
             return
 
-        # Collect images
+        # Collect images (up to 3 for FireRed)
         image_paths = []
-        path1 = self.edit_image1_drop.get_image_path()
-        if path1:
-            image_paths.append(path1)
-        path2 = self.edit_image2_drop.get_image_path()
-        if path2:
-            image_paths.append(path2)
+        for drop in (self.edit_image1_drop, self.edit_image2_drop, self.edit_image3_drop):
+            p = drop.get_image_path()
+            if p:
+                image_paths.append(p)
 
         if not image_paths:
             self.status_bar.showMessage("Drop or select at least one reference image")
@@ -694,6 +737,9 @@ class MainWindow(QMainWindow):
             input_image_paths=image_paths,
             bot_task=self.system_bar.get_global_bot_task(),
             drop_think=self.system_bar.get_global_drop_think(),
+            use_ollama=self.edit_enhance_check.isChecked(),
+            ollama_length=self.edit_ollama_length.currentText(),
+            ollama_complexity=self.edit_ollama_complexity.currentText(),
         )
 
         self.edit_generate_btn.setEnabled(False)
@@ -827,6 +873,13 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_gallery_image_selected(self, image_path):
         """Show selected gallery image in the output panel."""
+        # Pass the gallery's full image list so the output panel's full-size
+        # viewer can navigate with arrow keys
+        sender = self.sender()
+        if hasattr(sender, '_thumbnails'):
+            self.output_panel.image_view._image_list = [
+                t.image_path for t in sender._thumbnails
+            ]
         self.output_panel.display_image(image_path)
 
     # ─── Keyboard Shortcuts ───────────────────────────────────
@@ -880,7 +933,7 @@ class MainWindow(QMainWindow):
         from ui.constants import MODEL_INFO, get_default_guidance
         info = MODEL_INFO.get(model_type, {})
         supports_i2i = info.get("supports_img2img", False)
-        is_instruct = model_type in ("instruct", "distil", "instruct_int8", "distil_int8")
+        is_instruct = model_type in ("instruct", "distil", "nf4", "distil_nf4", "instruct_int8", "distil_int8")
 
         # Show/hide CoT display in Generate tab
         self.gen_cot_group.setVisible(is_instruct)
@@ -1251,6 +1304,14 @@ class MainWindow(QMainWindow):
         # Dataset Prep tab
         dataset_prep_state = self.dataset_prep_panel.get_state_dict()
 
+        # LM Studio settings (per-project)
+        from core.settings import get_settings
+        settings = get_settings()
+        lmstudio_state = {
+            "url": settings.lmstudio_url,
+            "system_prompt": settings.enhance_system_prompt,
+        }
+
         return {
             "version": "1.0",
             "generate": generate_state,
@@ -1258,6 +1319,7 @@ class MainWindow(QMainWindow):
             "edit": edit_state,
             "i2i_batch": i2i_batch_state,
             "dataset_prep": dataset_prep_state,
+            "lmstudio": lmstudio_state,
         }
 
     def _apply_project_state(self, data: dict):
@@ -1313,6 +1375,16 @@ class MainWindow(QMainWindow):
         if "dataset_prep" in data:
             self.dataset_prep_panel.set_state_dict(data["dataset_prep"])
 
+        # LM Studio settings (per-project)
+        if "lmstudio" in data:
+            from core.settings import get_settings
+            settings = get_settings()
+            lm = data["lmstudio"]
+            if "url" in lm:
+                settings.lmstudio_url = lm["url"]
+            if "system_prompt" in lm:
+                settings.enhance_system_prompt = lm["system_prompt"]
+
     @Slot()
     def _on_save_project(self):
         """Save current project (quick save if name exists)."""
@@ -1346,36 +1418,32 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_load_project(self):
-        """Load a saved project."""
-        from core.project_manager import get_saved_projects, load_project
-        from PySide6.QtWidgets import QInputDialog
+        """Load a saved project (custom dialog with dates, sorting, delete)."""
+        from widgets.project_load_dialog import ProjectLoadDialog
+        from core.project_manager import load_project
 
-        projects = get_saved_projects()
-        if not projects:
-            QMessageBox.information(
-                self, "No Projects", "No saved projects found."
-            )
+        dlg = ProjectLoadDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-
-        name, ok = QInputDialog.getItem(
-            self, "Load Project", "Select project:", projects, 0, False
-        )
-        if ok and name:
-            try:
-                data = load_project(name)
-                if data:
-                    self._apply_project_state(data)
-                    self._current_project_name = name
-                    self.status_bar.showMessage(f"Project loaded: {name}")
-                    self.setWindowTitle(f"HunyuanImage Desktop - {name}")
-                else:
-                    QMessageBox.warning(
-                        self, "Load Error", f"Project '{name}' not found."
-                    )
-            except Exception as e:
+        name = dlg.selected_name()
+        if not name:
+            return
+        try:
+            data = load_project(name)
+            if data:
+                self._apply_project_state(data)
+                self._current_project_name = name
+                display = data.get("_display_name", name)
+                self.status_bar.showMessage(f"Project loaded: {display}")
+                self.setWindowTitle(f"HunyuanImage Desktop - {display}")
+            else:
                 QMessageBox.warning(
-                    self, "Load Error", f"Failed to load project: {e}"
+                    self, "Load Error", f"Project '{name}' not found."
                 )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Load Error", f"Failed to load project: {e}"
+            )
 
     # ─── State Persistence ────────────────────────────────────
 
@@ -1399,7 +1467,7 @@ class MainWindow(QMainWindow):
         self.gallery_dock.setVisible(self.settings.gallery_visible)
 
     def closeEvent(self, event):
-        """Save state on close."""
+        """Save state on close, optionally keep model loaded."""
         self.settings.save_geometry(self.saveGeometry())
         self.settings.save_window_state(self.saveState())
         self.settings.last_tab_index = self.tabs.currentIndex()
@@ -1413,6 +1481,12 @@ class MainWindow(QMainWindow):
 
         if self._ollama_worker and self._ollama_worker.isRunning():
             self._ollama_worker.wait(3000)
+
+        # Silently keep the model in VRAM on quit — reload from the OS page
+        # cache is near-instant and avoids interrupting the user with a dialog.
+        if self.state.is_model_loaded():
+            self.settings.keep_model_loaded = True
+            self.settings.last_model_type = self.state.get_model_type()
 
         # Clean up log panel (restore stdout/stderr)
         if hasattr(self, 'log_panel'):

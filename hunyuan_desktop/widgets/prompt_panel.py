@@ -2,7 +2,8 @@
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QComboBox, QCheckBox, QPushButton, QGroupBox, QTextEdit
+    QComboBox, QCheckBox, QPushButton, QGroupBox, QTextEdit,
+    QDialog, QDialogButtonBox
 )
 from PySide6.QtCore import Signal, Slot
 
@@ -54,12 +55,12 @@ class PromptPanel(QWidget):
         layout.addLayout(style_layout)
 
         # Enhancement group
-        enhance_group = QGroupBox("Prompt Enhancement (Ollama)")
+        enhance_group = QGroupBox("Prompt Enhancement (LM Studio)")
         enhance_layout = QVBoxLayout()
 
         # Enable checkbox + model selector
         row1 = QHBoxLayout()
-        self.use_ollama = QCheckBox("Enhance with Ollama")
+        self.use_ollama = QCheckBox("Enhance with LM Studio")
         row1.addWidget(self.use_ollama)
         row1.addWidget(QLabel("Model:"))
         self.ollama_model = QComboBox()
@@ -80,7 +81,7 @@ class PromptPanel(QWidget):
         # Enhance / Undo buttons
         row3 = QHBoxLayout()
         self.enhance_btn = QPushButton("Enhance Now")
-        self.enhance_btn.setToolTip("Enhance the prompt with Ollama (Ctrl+E)")
+        self.enhance_btn.setToolTip("Enhance the prompt with LM Studio (Ctrl+E)")
         row3.addWidget(self.enhance_btn)
         self.undo_enhance_btn = QPushButton("Undo")
         self.undo_enhance_btn.setToolTip("Restore original prompt before enhancement")
@@ -89,6 +90,19 @@ class PromptPanel(QWidget):
         self.enhance_status = QLabel("")
         row3.addWidget(self.enhance_status, stretch=1)
         enhance_layout.addLayout(row3)
+
+        # LM Studio Settings button — always visible, separate row
+        settings_row = QHBoxLayout()
+        self.edit_sysprompt_btn = QPushButton("LM Studio Settings (URL + System Prompt)")
+        self.edit_sysprompt_btn.setToolTip(
+            "Edit the LM Studio server URL and the system prompt used for enhancement"
+        )
+        self.edit_sysprompt_btn.setStyleSheet(
+            "QPushButton { background-color: #3a3a5a; padding: 6px; }"
+            "QPushButton:hover { background-color: #4a4a7a; }"
+        )
+        settings_row.addWidget(self.edit_sysprompt_btn)
+        enhance_layout.addLayout(settings_row)
 
         enhance_group.setLayout(enhance_layout)
         layout.addWidget(enhance_group)
@@ -103,7 +117,7 @@ class PromptPanel(QWidget):
         preview_btn_row.addWidget(self.preview_wildcards_btn)
 
         self.preview_enhanced_btn = QPushButton("Preview Enhanced")
-        self.preview_enhanced_btn.setToolTip("Resolve wildcards AND run Ollama enhancement")
+        self.preview_enhanced_btn.setToolTip("Resolve wildcards AND run LM Studio enhancement")
         preview_btn_row.addWidget(self.preview_enhanced_btn)
 
         self.preview_status = QLabel("")
@@ -130,6 +144,7 @@ class PromptPanel(QWidget):
         self.use_ollama.toggled.connect(self._toggle_ollama_controls)
         self.enhance_btn.clicked.connect(self._on_enhance)
         self.undo_enhance_btn.clicked.connect(self._on_undo_enhance)
+        self.edit_sysprompt_btn.clicked.connect(self._on_edit_system_prompt)
         self.state.enhancement_completed.connect(self._on_enhancement_done)
         self.state.enhancement_failed.connect(self._on_enhancement_failed)
         self.preview_wildcards_btn.clicked.connect(self._on_preview_wildcards)
@@ -157,19 +172,20 @@ class PromptPanel(QWidget):
         self.ollama_complexity.setCurrentText("detailed")
 
     def _refresh_ollama_models(self):
-        """Refresh the list of available Ollama models."""
+        """Refresh the list of available models from LM Studio or Ollama."""
         self.ollama_model.clear()
         try:
-            if self.state.state.ollama_available and self.state.state.ollama_manager:
-                models = self.state.state.ollama_manager.list_models()
+            from lmstudio_client import LMStudioClient
+            from ui.constants import get_lmstudio_url
+            client = LMStudioClient(base_url=get_lmstudio_url())
+            if client.is_available():
+                models = client.list_models()
                 for m in models:
-                    self.ollama_model.addItem(m.get("name", str(m)))
-                if not models:
-                    self.ollama_model.addItem("qwen2.5:7b-instruct")
-            else:
-                self.ollama_model.addItem("qwen2.5:7b-instruct")
+                    self.ollama_model.addItem(m)
+            if self.ollama_model.count() == 0:
+                self.ollama_model.addItem("lmstudio")
         except Exception:
-            self.ollama_model.addItem("qwen2.5:7b-instruct")
+            self.ollama_model.addItem("lmstudio")
 
     @Slot(bool)
     def _toggle_ollama_controls(self, enabled: bool):
@@ -203,6 +219,168 @@ class PromptPanel(QWidget):
             self.prompt_editor.setPlainText(self._original_prompt)
             self.undo_enhance_btn.setEnabled(False)
             self.enhance_status.setText("Restored original prompt")
+
+    @Slot()
+    def _on_edit_system_prompt(self):
+        """Open a dialog to edit the LM Studio system prompt."""
+        from core.settings import get_settings
+        from ollama_prompts import get_enhance_system_prompt
+
+        settings = get_settings()
+        saved = settings.enhance_system_prompt
+
+        # Generate the current default so the user can see/copy it
+        length = self.ollama_length.currentText()
+        if length == "random":
+            length = "medium"
+        complexity = self.ollama_complexity.currentText()
+        if complexity == "random":
+            complexity = "detailed"
+        default_prompt = get_enhance_system_prompt(length, complexity)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("LM Studio Settings")
+        dialog.setMinimumSize(700, 550)
+        dlg_layout = QVBoxLayout(dialog)
+
+        # LM Studio URL
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("LM Studio URL:"))
+        url_edit = QLineEdit()
+        url_edit.setText(settings.lmstudio_url)
+        url_edit.setPlaceholderText("http://localhost:1234 (leave empty for default)")
+        url_row.addWidget(url_edit, stretch=1)
+
+        discover_btn = QPushButton("Auto-Discover")
+        discover_btn.setToolTip("Scan local network for LM Studio server")
+        discover_status = QLabel("")
+
+        def _do_discover():
+            discover_btn.setEnabled(False)
+            discover_status.setText("Scanning network...")
+            import threading
+            from PySide6.QtCore import QMetaObject, Qt as QtConst, Q_ARG
+
+            def _scan():
+                from lmstudio_client import discover_lmstudio, LMStudioClient
+                try:
+                    found_url = discover_lmstudio()
+                except Exception:
+                    found_url = None
+                if found_url:
+                    try:
+                        client = LMStudioClient(base_url=found_url)
+                        model = client.get_loaded_model()
+                        model_info = f" -- model: {model}" if model else ""
+                    except Exception:
+                        model_info = ""
+                    # Marshal back to main thread
+                    QMetaObject.invokeMethod(
+                        url_edit, "setText", QtConst.ConnectionType.QueuedConnection,
+                        Q_ARG(str, found_url))
+                    QMetaObject.invokeMethod(
+                        discover_status, "setText", QtConst.ConnectionType.QueuedConnection,
+                        Q_ARG(str, f"Found: {found_url}{model_info}"))
+                else:
+                    QMetaObject.invokeMethod(
+                        discover_status, "setText", QtConst.ConnectionType.QueuedConnection,
+                        Q_ARG(str, "No LM Studio found on network"))
+                QMetaObject.invokeMethod(
+                    discover_btn, "setEnabled", QtConst.ConnectionType.QueuedConnection,
+                    Q_ARG(bool, True))
+            threading.Thread(target=_scan, daemon=True).start()
+
+        discover_btn.clicked.connect(_do_discover)
+        url_row.addWidget(discover_btn)
+        dlg_layout.addLayout(url_row)
+        dlg_layout.addWidget(discover_status)
+
+        # Length/Complexity preview — shows what the auto-generated prompt looks like
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(QLabel("Preview default for:"))
+        preview_row.addWidget(QLabel("Length:"))
+        from ui.constants import OLLAMA_LENGTH_OPTIONS, OLLAMA_COMPLEXITY_OPTIONS
+        dlg_length = QComboBox()
+        dlg_length.addItems([x for x in OLLAMA_LENGTH_OPTIONS if x != "random"])
+        dlg_length.setCurrentText(length)
+        preview_row.addWidget(dlg_length)
+        preview_row.addWidget(QLabel("Complexity:"))
+        dlg_complexity = QComboBox()
+        dlg_complexity.addItems([x for x in OLLAMA_COMPLEXITY_OPTIONS if x != "random"])
+        dlg_complexity.setCurrentText(complexity)
+        preview_row.addWidget(dlg_complexity)
+        preview_row.addStretch()
+        dlg_layout.addLayout(preview_row)
+
+        # Show current default for reference
+        default_label = QLabel("Auto-generated default (read-only — changes with length/complexity above):")
+        dlg_layout.addWidget(default_label)
+        default_display = QTextEdit()
+        default_display.setPlainText(default_prompt)
+        default_display.setReadOnly(True)
+        default_display.setMaximumHeight(150)
+        default_display.setStyleSheet(
+            "color: #999; background-color: #1e1e1e; border: 1px solid #404040; padding: 4px;"
+        )
+        dlg_layout.addWidget(default_display)
+
+        def _update_default_preview():
+            p = get_enhance_system_prompt(dlg_length.currentText(), dlg_complexity.currentText())
+            default_display.setPlainText(p)
+        dlg_length.currentTextChanged.connect(lambda: _update_default_preview())
+        dlg_complexity.currentTextChanged.connect(lambda: _update_default_preview())
+
+        dlg_layout.addWidget(QLabel(
+            "Your custom system prompt (overrides the default above — leave empty to use default):"
+        ))
+
+        dlg_layout.addWidget(QLabel("Your custom system prompt:"))
+        editor = QTextEdit()
+        editor.setPlainText(saved)
+        editor.setPlaceholderText(
+            "Enter your custom system prompt here...\n\n"
+            "The user's prompt will be sent as the user message.\n"
+            "This replaces the auto-generated system prompt entirely."
+        )
+        editor.setMinimumHeight(200)
+        dlg_layout.addWidget(editor)
+
+        # Buttons: Copy Default | Reset | Cancel | Save
+        btn_row = QHBoxLayout()
+        copy_default_btn = QPushButton("Copy Default to Editor")
+        copy_default_btn.clicked.connect(lambda: editor.setPlainText(default_prompt))
+        btn_row.addWidget(copy_default_btn)
+        reset_btn = QPushButton("Clear (Use Default)")
+        reset_btn.clicked.connect(lambda: editor.clear())
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        btn_row.addWidget(button_box)
+        dlg_layout.addLayout(btn_row)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Save URL
+            new_url = url_edit.text().strip()
+            settings.lmstudio_url = new_url
+
+            # Save system prompt
+            new_prompt = editor.toPlainText().strip()
+            settings.enhance_system_prompt = new_prompt
+
+            parts = []
+            if new_url:
+                parts.append(f"URL: {new_url}")
+            if new_prompt:
+                parts.append("Custom system prompt saved")
+            self.enhance_status.setText("; ".join(parts) if parts else "Using defaults")
+
+            # Refresh model list with new URL
+            self._refresh_ollama_models()
 
     @Slot(str, str)
     def _on_enhancement_done(self, original: str, enhanced: str):
@@ -282,7 +460,7 @@ class PromptPanel(QWidget):
         resolved = self._resolve_wildcards(full_prompt)
 
         # Show wildcard-resolved version immediately
-        self.preview_display.setText("--- Wildcards Resolved ---\n" + resolved + "\n\n--- Enhancing with Ollama... ---")
+        self.preview_display.setText("--- Wildcards Resolved ---\n" + resolved + "\n\n--- Enhancing with LM Studio... ---")
         self.preview_status.setText("Enhancing...")
         self.preview_enhanced_btn.setEnabled(False)
 
@@ -305,7 +483,7 @@ class PromptPanel(QWidget):
     def _on_preview_enhance_done(self, original, enhanced):
         """Handle preview enhancement completion."""
         lines = []
-        lines.append("--- Enhanced (Ollama) ---")
+        lines.append("--- Enhanced (LM Studio) ---")
         lines.append(enhanced)
         lines.append("")
         lines.append("--- Wildcards Resolved ---")

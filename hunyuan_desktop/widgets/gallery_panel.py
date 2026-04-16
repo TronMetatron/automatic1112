@@ -6,10 +6,10 @@ from typing import List
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QScrollArea, QLayout, QFileDialog, QSizePolicy,
-    QMenu
+    QMenu, QDialog, QGraphicsView, QGraphicsScene
 )
-from PySide6.QtGui import QPixmap
-from PySide6.QtCore import Qt, Signal, Slot, QRect, QSize, QPoint
+from PySide6.QtGui import QPixmap, QWheelEvent, QKeySequence, QShortcut, QDrag
+from PySide6.QtCore import Qt, Signal, Slot, QRect, QSize, QPoint, QUrl, QMimeData
 
 
 class FlowLayout(QLayout):
@@ -92,10 +92,135 @@ class FlowLayout(QLayout):
                 item.widget().deleteLater()
 
 
+class FullImageDialog(QDialog):
+    """Full-size image viewer dialog with zoom, pan, and arrow-key navigation."""
+
+    def __init__(self, image_path: str, parent=None, image_list: list = None):
+        super().__init__(parent)
+        self.setMinimumSize(800, 600)
+        self.resize(1200, 900)
+
+        # Image list for navigation
+        self._image_list = image_list or [image_path]
+        self._current_index = 0
+        if image_path in self._image_list:
+            self._current_index = self._image_list.index(image_path)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._scene = QGraphicsScene(self)
+        self._view = QGraphicsView(self._scene)
+        self._view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self._view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self._view.setBackgroundBrush(Qt.GlobalColor.black)
+        self._view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._view.wheelEvent = self._wheel_zoom
+        self._pixmap_item = None
+
+        layout.addWidget(self._view)
+
+        # Info / nav bar
+        info = QHBoxLayout()
+        self._prev_btn = QPushButton("<")
+        self._prev_btn.setMaximumWidth(30)
+        self._prev_btn.clicked.connect(self._prev_image)
+        info.addWidget(self._prev_btn)
+
+        self._info_label = QLabel()
+        info.addWidget(self._info_label, stretch=1)
+
+        self._next_btn = QPushButton(">")
+        self._next_btn.setMaximumWidth(30)
+        self._next_btn.clicked.connect(self._next_image)
+        info.addWidget(self._next_btn)
+
+        fit_btn = QPushButton("Fit")
+        fit_btn.setMaximumWidth(40)
+        fit_btn.clicked.connect(self._fit)
+        info.addWidget(fit_btn)
+        actual_btn = QPushButton("1:1")
+        actual_btn.setMaximumWidth(40)
+        actual_btn.clicked.connect(self._actual_size)
+        info.addWidget(actual_btn)
+        layout.addLayout(info)
+
+        # Load initial image
+        self._load_image(self._current_index)
+
+        # Keyboard shortcuts
+        close_shortcut = QShortcut(QKeySequence("Escape"), self)
+        close_shortcut.activated.connect(self.close)
+
+    def _load_image(self, index: int):
+        """Load and display the image at the given index."""
+        if not self._image_list or index < 0 or index >= len(self._image_list):
+            return
+        self._current_index = index
+        image_path = self._image_list[index]
+
+        self._scene.clear()
+        pixmap = QPixmap(image_path)
+        if not pixmap.isNull():
+            self._pixmap_item = self._scene.addPixmap(pixmap)
+            self._view.resetTransform()
+            self._view.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+            dims = f"{pixmap.width()}x{pixmap.height()}"
+        else:
+            self._pixmap_item = None
+            dims = ""
+
+        name = Path(image_path).name
+        total = len(self._image_list)
+        self.setWindowTitle(f"{name} ({index + 1}/{total})")
+        self._info_label.setText(f"  {name}  {dims}  [{index + 1}/{total}]")
+        self._prev_btn.setEnabled(index > 0)
+        self._next_btn.setEnabled(index < total - 1)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_A):
+            self._prev_image()
+        elif key in (Qt.Key.Key_Right, Qt.Key.Key_D):
+            self._next_image()
+        else:
+            super().keyPressEvent(event)
+
+    def _prev_image(self):
+        if self._current_index > 0:
+            self._load_image(self._current_index - 1)
+
+    def _next_image(self):
+        if self._current_index < len(self._image_list) - 1:
+            self._load_image(self._current_index + 1)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._pixmap_item:
+            self._view.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _wheel_zoom(self, event):
+        factor = 1.15
+        if event.angleDelta().y() < 0:
+            factor = 1.0 / factor
+        self._view.scale(factor, factor)
+
+    def _fit(self):
+        if self._pixmap_item:
+            self._view.resetTransform()
+            self._view.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _actual_size(self):
+        if self._pixmap_item:
+            self._view.resetTransform()
+
+
 class ThumbnailWidget(QWidget):
     """Clickable thumbnail image with hover effect."""
 
     clicked = Signal(str)  # image_path
+    double_clicked = Signal(str)  # image_path
     context_menu_requested = Signal(str, object)  # image_path, QPoint (global pos)
 
     def __init__(self, image_path: str, size: int = 150, parent=None):
@@ -146,9 +271,41 @@ class ThumbnailWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.pos()
             self.clicked.emit(self.image_path)
         elif event.button() == Qt.MouseButton.RightButton:
             self.context_menu_requested.emit(self.image_path, self.mapToGlobal(event.pos()))
+
+    def mouseMoveEvent(self, event):
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        if not hasattr(self, '_drag_start_pos'):
+            return
+        if (event.pos() - self._drag_start_pos).manhattanLength() < 20:
+            return
+
+        # Build file list: image + JSON sidecar
+        urls = [QUrl.fromLocalFile(self.image_path)]
+        json_path = Path(self.image_path).with_suffix(".json")
+        if json_path.exists():
+            urls.append(QUrl.fromLocalFile(str(json_path)))
+
+        mime = QMimeData()
+        mime.setUrls(urls)
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        # Use thumbnail as drag pixmap
+        if not self._pixmap.isNull():
+            drag.setPixmap(self._pixmap.scaled(
+                80, 80, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            ))
+        drag.exec(Qt.DropAction.CopyAction)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.double_clicked.emit(self.image_path)
 
 
 class GalleryPanel(QWidget):
@@ -156,6 +313,7 @@ class GalleryPanel(QWidget):
 
     image_selected = Signal(str)  # image_path
     insert_prompt_requested = Signal(str)  # prompt text from image metadata
+    _compare_slot = ""  # class-level so it persists across context menu calls
 
     def __init__(self, desktop_state=None, parent=None):
         super().__init__(parent)
@@ -235,6 +393,7 @@ class GalleryPanel(QWidget):
         """Add a single thumbnail to the gallery."""
         thumb = ThumbnailWidget(image_path)
         thumb.clicked.connect(self.image_selected.emit)
+        thumb.double_clicked.connect(self._on_thumbnail_double_click)
         thumb.context_menu_requested.connect(self._on_thumbnail_context_menu)
         self._thumbnails.append(thumb)
         self._flow_layout.addWidget(thumb)
@@ -250,11 +409,36 @@ class GalleryPanel(QWidget):
         """Set the directory label without loading."""
         self.dir_path.setText(directory)
 
+    def _on_thumbnail_double_click(self, image_path):
+        """Open full-size image viewer on double-click with navigation."""
+        image_list = [t.image_path for t in self._thumbnails]
+        dialog = FullImageDialog(image_path, self, image_list=image_list)
+        dialog.exec()
+
     def _on_thumbnail_context_menu(self, image_path, global_pos):
-        """Show context menu for a thumbnail with insert prompt option."""
+        """Show context menu for a thumbnail with insert prompt and compare options."""
         import json
 
         menu = QMenu(self)
+
+        # View full size
+        view_action = menu.addAction("View Full Size")
+        view_action.triggered.connect(lambda: self._on_thumbnail_double_click(image_path))
+
+        # Compare
+        if not GalleryPanel._compare_slot:
+            compare_action = menu.addAction("Mark for Compare")
+            compare_action.triggered.connect(lambda: self._mark_compare(image_path))
+        else:
+            if image_path != GalleryPanel._compare_slot:
+                compare_action = menu.addAction(
+                    f"Compare with {Path(GalleryPanel._compare_slot).name[:25]}..."
+                )
+                compare_action.triggered.connect(lambda: self._do_compare(image_path))
+            clear_compare = menu.addAction("Clear Compare Selection")
+            clear_compare.triggered.connect(self._clear_compare)
+
+        menu.addSeparator()
 
         # Try to load the JSON sidecar
         json_path = Path(image_path).with_suffix(".json")
@@ -272,15 +456,27 @@ class GalleryPanel(QWidget):
         if prompt_text:
             insert_action = menu.addAction(f"Insert Prompt: {prompt_text[:50]}...")
             insert_action.triggered.connect(
-                lambda: self.insert_prompt_requested.emit(prompt_text)
+                lambda checked, p=prompt_text: self.insert_prompt_requested.emit(p)
             )
         if full_prompt_text and full_prompt_text != prompt_text:
-            insert_full_action = menu.addAction(f"Insert Full Prompt: {full_prompt_text[:50]}...")
+            insert_full_action = menu.addAction(f"Insert Enhanced Prompt: {full_prompt_text[:50]}...")
             insert_full_action.triggered.connect(
-                lambda: self.insert_prompt_requested.emit(full_prompt_text)
+                lambda checked, p=full_prompt_text: self.insert_prompt_requested.emit(p)
             )
         if not prompt_text and not full_prompt_text:
             no_data = menu.addAction("No prompt metadata found")
             no_data.setEnabled(False)
 
         menu.exec(global_pos)
+
+    def _mark_compare(self, image_path):
+        GalleryPanel._compare_slot = image_path
+
+    def _do_compare(self, image_path):
+        from widgets.output_panel import CompareDialog
+        dialog = CompareDialog(GalleryPanel._compare_slot, image_path, self)
+        GalleryPanel._compare_slot = ""
+        dialog.exec()
+
+    def _clear_compare(self):
+        GalleryPanel._compare_slot = ""
