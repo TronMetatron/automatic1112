@@ -13,13 +13,20 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 MODEL_DIR = Path(os.environ.get("A1112_MODEL_DIR", str(Path.home() / "automatic1112_models")))
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 
-# Model variants (pointing to hun3d model copies)
+# Model variants
 MODEL_PATHS = {
+    # SDNQ uint4 (dual-GPU, ~93GB peak VRAM)
     "base": MODEL_DIR / "HunyuanImage3-SDNQ",
     "instruct": MODEL_DIR / "HunyuanImage3-Instruct-SDNQ",
     "distil": MODEL_DIR / "HunyuanImage3-Distil-SDNQ",
+    # NF4 (single GPU, ~48GB VRAM)
     "nf4": MODEL_DIR / "HunyuanImage3-Instruct-NF4-v2",
     "distil_nf4": MODEL_DIR / "HunyuanImage3-Distil-NF4-v2",
+    # INT8 (Blackwell-optimized, ~83GB — jamesw767 on HuggingFace)
+    "base_int8": MODEL_DIR / "HunyuanImage-3-Base-INT8",
+    "instruct_int8": MODEL_DIR / "HunyuanImage-3-Instruct-INT8",
+    "distil_int8": MODEL_DIR / "HunyuanImage-3-Instruct-Distil-INT8",
+    # Other
     "firered": MODEL_DIR / "FireRed-Image-Edit-1.1",
 }
 
@@ -51,6 +58,24 @@ MODEL_INFO = {
     "distil_nf4": {
         "name": "HunyuanImage-3.0 Distil NF4",
         "description": "NF4 4-bit quantized Distil — fast 8-step T2I+I2I (single GPU, ~48GB VRAM)",
+        "default_steps": 8,
+        "supports_img2img": True,
+    },
+    "base_int8": {
+        "name": "HunyuanImage-3.0 Base INT8",
+        "description": "INT8 quantized Base — Blackwell-optimized (single GPU, ~83GB VRAM)",
+        "default_steps": 20,
+        "supports_img2img": False,
+    },
+    "instruct_int8": {
+        "name": "HunyuanImage-3.0 Instruct INT8",
+        "description": "INT8 quantized Instruct — Blackwell-optimized T2I+I2I (~83GB VRAM)",
+        "default_steps": 50,
+        "supports_img2img": True,
+    },
+    "distil_int8": {
+        "name": "HunyuanImage-3.0 Distil INT8",
+        "description": "INT8 quantized Distil — Blackwell-optimized fast 8-step (~83GB VRAM)",
         "default_steps": 8,
         "supports_img2img": True,
     },

@@ -39,11 +39,17 @@ Currently shipping with HunyuanImage-3.0 support. More model backends are planne
 
 | Model | Type | VRAM | Steps | Notes |
 |-------|------|------|-------|-------|
-| HunyuanImage-3.0 Base (SDNQ uint4) | T2I | ~93GB peak | 20 | Fastest, text-to-image only |
-| HunyuanImage-3.0 Instruct (SDNQ) | T2I + I2I | ~93GB peak | 50 | Full feature set |
-| HunyuanImage-3.0 Distil (SDNQ) | T2I + I2I | ~93GB peak | 8 | Fast distilled variant |
-| HunyuanImage-3.0 Instruct (NF4) | T2I + I2I | ~48GB | 50 | Single GPU friendly |
-| HunyuanImage-3.0 Distil (NF4) | T2I + I2I | ~48GB | 8 | Single GPU, fast |
+| **SDNQ uint4** (dual-GPU) | | | | |
+| HunyuanImage-3.0 Base | T2I | ~93GB peak | 20 | Fastest, text-to-image only |
+| HunyuanImage-3.0 Instruct | T2I + I2I | ~93GB peak | 50 | Full feature set |
+| HunyuanImage-3.0 Distil | T2I + I2I | ~93GB peak | 8 | Fast distilled variant |
+| **INT8** (Blackwell-optimized) | | | | [jamesw767 on HF](https://huggingface.co/jamesw767) |
+| HunyuanImage-3.0 Base INT8 | T2I | ~83GB | 20 | Single Blackwell GPU |
+| HunyuanImage-3.0 Instruct INT8 | T2I + I2I | ~83GB | 50 | Single Blackwell GPU |
+| HunyuanImage-3.0 Distil INT8 | T2I + I2I | ~83GB | 8 | Single Blackwell GPU, fast |
+| **NF4** (single GPU) | | | | |
+| HunyuanImage-3.0 Instruct NF4 | T2I + I2I | ~48GB | 50 | Most accessible |
+| HunyuanImage-3.0 Distil NF4 | T2I + I2I | ~48GB | 8 | Single GPU, fast |
 
 ## Hardware Requirements
 
@@ -115,10 +121,20 @@ export A1112_MODEL_DIR="$HOME/automatic1112_models"  # Linux
 # set A1112_MODEL_DIR=%USERPROFILE%\automatic1112_models  # Windows
 ```
 
-Download from HuggingFace:
+Download from HuggingFace -- pick the quantization that fits your GPU:
 
 ```bash
-# NF4 models (recommended starting point -- single GPU, ~48GB VRAM)
+# INT8 models (Blackwell-optimized, single GPU ~83GB VRAM -- by jamesw767)
+huggingface-cli download jamesw767/HunyuanImage-3-Instruct-Distil-INT8 \
+    --local-dir "$A1112_MODEL_DIR/HunyuanImage-3-Instruct-Distil-INT8"
+
+huggingface-cli download jamesw767/HunyuanImage-3-Instruct-INT8 \
+    --local-dir "$A1112_MODEL_DIR/HunyuanImage-3-Instruct-INT8"
+
+huggingface-cli download jamesw767/HunyuanImage-3-Base-INT8 \
+    --local-dir "$A1112_MODEL_DIR/HunyuanImage-3-Base-INT8"
+
+# NF4 models (single GPU, ~48GB VRAM)
 huggingface-cli download Disty0/HunyuanImage3-Instruct-NF4-v2 \
     --local-dir "$A1112_MODEL_DIR/HunyuanImage3-Instruct-NF4-v2"
 
@@ -201,6 +217,7 @@ automatic1112/
 ## Credits
 
 - [HunyuanImage-3.0](https://github.com/Tencent/HunyuanImage) by Tencent
+- [INT8 Blackwell-optimized quantizations](https://huggingface.co/jamesw767) by jamesw767
 - [SDNQ quantization](https://huggingface.co/Disty0) by Disty0
 - Inspired by [AUTOMATIC1111/stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) -- the OG, the legend, the 162k-star giant whose shoulders we stand on
 
