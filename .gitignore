@@ -44,3 +44,6 @@ outputs/
 
 # Wildcard data (large JSON)
 wildcards.json
+
+# Setup script (contains no secrets but not needed in repo)
+setup_github.sh
